@@ -687,7 +687,7 @@ extension InferenceEngine {
                     for await generation in stream {
                         guard !Task.isCancelled else { break }
 
-                        if case .chunk(let text, tokenId: _) = generation {
+                        if case .chunk(let text, tokenId: _, logprob: _) = generation {
                             // Record time-to-first-token on the very first chunk
                             if firstTokenDate == nil {
                                 firstTokenDate = Date()
