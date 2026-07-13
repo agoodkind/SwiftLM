@@ -1527,7 +1527,7 @@ func handleChatCompletion(
                     case .token(let tokenID, _, _, _):
                         box.detokenizer.append(token: tokenID)
                         if let chunk = box.detokenizer.next() {
-                            continuation.yield(.chunk(chunk, tokenId: tokenID))
+                            continuation.yield(.chunk(chunk, tokenId: tokenID, logprob: 0))
                         }
                     case .prefill, .prefillProgress:
                         break
@@ -1544,7 +1544,8 @@ func handleChatCompletion(
             return handleChatStreaming(
                 stream: genStream, modelId: modelId, stopSequences: stopSequences,
                 includeUsage: includeUsage, promptTokenCount: promptTokenCount,
-                enableThinking: enableThinking, jsonMode: jsonMode, semaphore: semaphore,
+                enableThinking: enableThinking, jsonMode: jsonMode,
+                logprobs: chatReq.logprobs == true, semaphore: semaphore,
                 stats: stats, genStart: genStart, prefillStart: prefillStart,
                 emitPrefillProgress: false, onPrefillDone: nil
             )
@@ -1552,7 +1553,7 @@ func handleChatCompletion(
             return try await handleChatNonStreaming(
                 stream: genStream, modelId: modelId, stopSequences: stopSequences,
                 promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-                jsonMode: jsonMode, semaphore: semaphore,
+                jsonMode: jsonMode, logprobs: chatReq.logprobs == true, semaphore: semaphore,
                 stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: nil
             )
         }
@@ -1670,7 +1671,8 @@ func handleChatCompletion(
         return handleChatStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
-            enableThinking: enableThinking, jsonMode: jsonMode, semaphore: semaphore,
+            enableThinking: enableThinking, jsonMode: jsonMode,
+            logprobs: chatReq.logprobs == true, semaphore: semaphore,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
             emitPrefillProgress: emitPrefillProgress, onPrefillDone: onPrefillDone
         )
@@ -1678,7 +1680,7 @@ func handleChatCompletion(
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-            jsonMode: jsonMode, semaphore: semaphore,
+            jsonMode: jsonMode, logprobs: chatReq.logprobs == true, semaphore: semaphore,
             stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: onPrefillDone
         )
     }
@@ -1768,6 +1770,7 @@ func handleChatStreaming(
     promptTokenCount: Int,
     enableThinking: Bool = false,
     jsonMode: Bool = false,
+    logprobs: Bool = false,
     semaphore: AsyncSemaphore,
     stats: ServerStats,
     genStart: Date,
@@ -1832,9 +1835,19 @@ func handleChatStreaming(
         for await generation in stream {
             if stopped { break }
             switch generation {
-            case .chunk(let text, _):
+            case .chunk(let text, _, let tokenLogprob):
                 completionTokenCount += 1
                 fullText += text
+                // Per-token OpenAI logprobs entry (chosen-token logprob; producer-only, no alternatives).
+                // Token string reuses the streaming detokenizer output `text`; no Tokenizer is in scope here.
+                let logprobsEntry: [[String: Any]]? = logprobs
+                    ? [[
+                        "token": text,
+                        "logprob": Double(tokenLogprob),
+                        "bytes": Array(text.utf8).map { Int($0) },
+                        "top_logprobs": [],
+                      ]]
+                    : nil
                 // GPU yield: prevent Metal from starving macOS WindowServer
                 if completionTokenCount % 8 == 0 {
                     try? await Task.sleep(for: .microseconds(50))
@@ -1922,7 +1935,8 @@ func handleChatStreaming(
                             modelId: modelId,
                             reasoningContent: hasReasoning ? reasoningText : nil,
                             content: hasContent ? contentText : nil,
-                            finishReason: nil
+                            finishReason: nil,
+                            logprobsContent: logprobsEntry
                         ))
                     }
                     // If tracker buffer is holding a partial tag, nothing to emit yet — that's fine.
@@ -2004,6 +2018,7 @@ func handleChatNonStreaming(
     promptTokenCount: Int,
     enableThinking: Bool = false,
     jsonMode: Bool = false,
+    logprobs: Bool = false,
     semaphore: AsyncSemaphore,
     stats: ServerStats,
     genStart: Date,
@@ -2016,11 +2031,20 @@ func handleChatNonStreaming(
     var tcIndex = 0
     var generationStopReason: GenerateStopReason = .stop
     var firstToken = true
+    // Accumulated per-token OpenAI logprobs entries (chosen-token logprob; producer-only).
+    var logprobsEntries: [LogprobEntry] = []
     for await generation in stream {
         switch generation {
-        case .chunk(let text, _):
+        case .chunk(let text, _, let tokenLogprob):
             fullText += text
             completionTokenCount += 1
+            if logprobs {
+                logprobsEntries.append(LogprobEntry(
+                    token: text,
+                    logprob: Double(tokenLogprob),
+                    bytes: Array(text.utf8).map { Int($0) }
+                ))
+            }
             // GPU yield: prevent Metal from starving macOS WindowServer
             if completionTokenCount % 8 == 0 {
                 try? await Task.sleep(for: .microseconds(50))
@@ -2109,7 +2133,8 @@ func handleChatNonStreaming(
                     reasoningContent: reasoningContent,
                     toolCalls: hasToolCalls ? collectedToolCalls : nil
                 ),
-                finishReason: hasToolCalls ? "tool_calls" : finishReason
+                finishReason: hasToolCalls ? "tool_calls" : finishReason,
+                logprobs: logprobs ? LogprobsContent(content: logprobsEntries) : nil
             )
         ],
         usage: TokenUsage(promptTokens: promptTokenCount, completionTokens: completionTokenCount, totalTokens: totalTokens),
@@ -2265,7 +2290,7 @@ func handleTextStreaming(
         for await generation in stream {
             if stopped { break }
             switch generation {
-            case .chunk(let text, _):
+            case .chunk(let text, _, _):
                 if firstToken {
                     heartbeatTask?.cancel()
                     heartbeatTask = nil
@@ -2340,7 +2365,7 @@ func handleTextNonStreaming(
     var completionTokenCount = 0
     for await generation in stream {
         switch generation {
-        case .chunk(let text, _):
+        case .chunk(let text, _, _):
             fullText += text
             completionTokenCount += 1
             // GPU yield: prevent Metal from starving macOS WindowServer
@@ -2530,7 +2555,7 @@ func sseHeaders() -> HTTPFields {
 /// - reasoningContent: if non-nil, added to delta as "reasoning_content" (llama-server thinking style)
 /// - content: if non-nil, added to delta as "content" (standard response text)
 /// Both may be nil simultaneously (used for the final finish_reason chunk).
-func sseChunk(modelId: String, reasoningContent: String?, content: String?, finishReason: String?) -> String {
+func sseChunk(modelId: String, reasoningContent: String?, content: String?, finishReason: String?, logprobsContent: [[String: Any]]? = nil) -> String {
     var deltaObj: [String: Any] = [:]
     // Always include role on the very first chunk when we have content
     if reasoningContent != nil || content != nil {
@@ -2546,6 +2571,9 @@ func sseChunk(modelId: String, reasoningContent: String?, content: String?, fini
         "index": 0,
         "delta": deltaObj,
     ]
+    if let logprobsContent {
+        choiceObj["logprobs"] = ["content": logprobsContent]
+    }
     if let finishReason {
         choiceObj["finish_reason"] = finishReason
     }
@@ -2816,6 +2844,10 @@ struct ChatCompletionRequest: Decodable {
     let chatTemplateKwargs: [String: Bool]?
     /// Top-level thinking override emitted by Aegis-AI gateway
     let enableThinking: Bool?
+    /// OpenAI logprobs: when true, emit chosen-token log-probabilities in the response.
+    let logprobs: Bool?
+    /// OpenAI top_logprobs: number of alternative tokens to return per position (not implemented; parsed for compatibility).
+    let topLogprobs: Int?
     /// Number of bits for native MLX quantized KV cache (nil = no quantization).
     /// Only 4 and 8 are supported by the underlying MLX QuantizedKVCache.
     /// Enables `QuantizedKVCache` instead of `KVCacheSimple`.  Separate from `--turbo-kv`.
@@ -2834,6 +2866,8 @@ struct ChatCompletionRequest: Decodable {
         case responseFormat = "response_format"
         case chatTemplateKwargs = "chat_template_kwargs"
         case enableThinking = "enable_thinking"
+        case logprobs
+        case topLogprobs = "top_logprobs"
         case kvBits = "kv_bits"
     }
 }
@@ -2887,10 +2921,45 @@ struct Choice: Encodable {
     let index: Int
     let message: AssistantMessage
     let finishReason: String
+    /// OpenAI logprobs: chosen-token log-probabilities. Nil (and omitted) unless requested.
+    let logprobs: LogprobsContent?
+
+    init(index: Int, message: AssistantMessage, finishReason: String, logprobs: LogprobsContent? = nil) {
+        self.index = index
+        self.message = message
+        self.finishReason = finishReason
+        self.logprobs = logprobs
+    }
 
     enum CodingKeys: String, CodingKey {
-        case index, message
+        case index, message, logprobs
         case finishReason = "finish_reason"
+    }
+}
+
+/// OpenAI `logprobs` object attached to a chat choice: `{ "content": [ ... ] }`.
+struct LogprobsContent: Encodable {
+    let content: [LogprobEntry]
+}
+
+/// One OpenAI logprobs content entry: the chosen token, its log-probability, and UTF-8 bytes.
+/// `topLogprobs` stays empty in this producer-only implementation (no alternative tokens).
+struct LogprobEntry: Encodable {
+    let token: String
+    let logprob: Double
+    let bytes: [Int]
+    let topLogprobs: [LogprobEntry]
+
+    init(token: String, logprob: Double, bytes: [Int], topLogprobs: [LogprobEntry] = []) {
+        self.token = token
+        self.logprob = logprob
+        self.bytes = bytes
+        self.topLogprobs = topLogprobs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case token, logprob, bytes
+        case topLogprobs = "top_logprobs"
     }
 }
 
