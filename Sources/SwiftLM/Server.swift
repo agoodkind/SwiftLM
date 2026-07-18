@@ -488,6 +488,14 @@ struct MLXServer: AsyncParsableCommand {
             switch plan.strategy {
             case .fullGPU:
                 print("[SwiftLM] \(plan.strategy.emoji) Memory strategy: FULL GPU (\(String(format: "%.1f", plan.weightMemoryGB))GB model, \(String(format: "%.1f", system.availableRAMGB))GB available)")
+                // Backstop: cap MLX's memory ceiling at 80% of physical RAM.
+                // The full-GPU strategy otherwise leaves the MLX default ceiling
+                // (about physical RAM) untouched, so a runaway buffer cache could
+                // consume the whole machine. The allocator size-bucketing keeps the
+                // cache near the working set in practice; this is the hard safety net.
+                let memoryBackstopBytes = Int(Double(system.totalRAMBytes) * 0.8)
+                Memory.memoryLimit = memoryBackstopBytes
+                print("[SwiftLM]    memory ceiling capped at \(memoryBackstopBytes / (1024*1024*1024))GB (80% of physical RAM)")
             case .swapAssisted:
                 if self.streamExperts {
                     // SSD Streaming: expert weights are mmap'd from SSD via the OS page cache.
