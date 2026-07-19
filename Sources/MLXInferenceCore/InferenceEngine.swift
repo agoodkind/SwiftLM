@@ -554,7 +554,7 @@ extension InferenceEngine {
         messages: [ChatMessage],
         config: GenerationConfig = .default
     ) -> AsyncStream<GenerationToken> {
-        AsyncStream { continuation in
+        AsyncStream<GenerationToken> { (continuation: AsyncStream<GenerationToken>.Continuation) in
             Task { @MainActor in
                 guard let container = self.container else {
                     continuation.finish(); return
