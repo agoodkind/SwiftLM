@@ -86,8 +86,8 @@ jobs:
         run: |
           swift package resolve
           git diff --exit-code -- Package.resolved
-          swift build --build-system native --jobs 4 -c "$CONFIGURATION" --build-tests
-          swift build --build-system native --jobs 4 -c "$CONFIGURATION" --show-bin-path > "$RUNNER_TEMP/bin-dir.txt"
+          swift build --build-system native --jobs 4 -c "$CONFIGURATION" -Xswiftc -enable-testing --build-tests
+          swift build --build-system native --jobs 4 -c "$CONFIGURATION" -Xswiftc -enable-testing --show-bin-path > "$RUNNER_TEMP/bin-dir.txt"
           read -r SWIFTLM_BIN_DIR < "$RUNNER_TEMP/bin-dir.txt"
           test -x "$SWIFTLM_BIN_DIR/SwiftLM"
           echo "SWIFTLM_BIN_DIR=$SWIFTLM_BIN_DIR" >> "$GITHUB_ENV"
@@ -135,7 +135,7 @@ jobs:
       - name: Discover the actual XCTest cases
         run: |
           if swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
-            --disable-swift-testing list --skip-build > "$RUNNER_TEMP/swiftlm-discovery.txt" 2> "$RUNNER_TEMP/swiftlm-discovery-errors.txt"; then
+            -Xswiftc -enable-testing --disable-swift-testing list --skip-build > "$RUNNER_TEMP/swiftlm-discovery.txt" 2> "$RUNNER_TEMP/swiftlm-discovery-errors.txt"; then
             cat "$RUNNER_TEMP/swiftlm-discovery-errors.txt"
             cat "$RUNNER_TEMP/swiftlm-discovery.txt"
           else
@@ -146,14 +146,10 @@ jobs:
 
       - name: Run all model free SwiftLM tests and the real HTTP regressions
         run: |
-          if swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
-            --disable-swift-testing --skip-build --filter SwiftLMTests > "$RUNNER_TEMP/swiftlm-runtime.log" 2>&1; then
-            cat "$RUNNER_TEMP/swiftlm-runtime.log"
-          else
-            status=$?
-            cat "$RUNNER_TEMP/swiftlm-runtime.log"
-            exit "$status"
-          fi
+          set -o pipefail
+          swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
+            -Xswiftc -enable-testing --disable-swift-testing --skip-build --filter SwiftLMTests \
+            2>&1 | tee "$RUNNER_TEMP/swiftlm-runtime.log"
           node .github/scripts/verify-integration-results.mjs swiftpm \
             "$RUNNER_TEMP/swiftlm-runtime.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
             SwiftLMTests OwnFeatureHTTPTests
