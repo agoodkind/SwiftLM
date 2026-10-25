@@ -5,7 +5,15 @@
 # exit 0, which looks like a short green pass; scripts/run-tests.sh bootstraps the metallib
 # and fails the run when too few tests executed.
 
-.PHONY: test test-filter
+JOBS ?= 4
+
+.PHONY: build-tests test-built test test-filter
+
+build-tests:
+	swift build --build-tests --jobs $(JOBS)
+
+test-built:
+	swift test --skip-build --disable-swift-testing $(TEST_FLAGS)
 
 test:
 	./scripts/run-tests.sh

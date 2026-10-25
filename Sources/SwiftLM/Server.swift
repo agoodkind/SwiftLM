@@ -1520,6 +1520,7 @@ struct MLXServer: AsyncParsableCommand {
             let activeMemMB = Memory.activeMemory / (1024 * 1024)
             let peakMemMB = Memory.peakMemory / (1024 * 1024)
             let cacheMemMB = Memory.cacheMemory / (1024 * 1024)
+            let allocationLimitMB = Memory.memoryLimit / (1024 * 1024)
             let deviceInfo = GPU.deviceInfo()
             let totalMemMB = deviceInfo.memorySize / (1024 * 1024)
             let snapshot = await stats.snapshot()
@@ -1547,7 +1548,7 @@ struct MLXServer: AsyncParsableCommand {
                 }
             }
             let payload = """
-{"status":"ok","model":"\(modelId)","vision":\(loadedAsVision),"memory":{"active_mb":\(activeMemMB),"peak_mb":\(peakMemMB),"cache_mb":\(cacheMemMB),"total_system_mb":\(totalMemMB),"gpu_architecture":"\(deviceInfo.architecture)"},"stats":{"requests_total":\(snapshot.requestsTotal),"requests_active":\(snapshot.requestsActive),"tokens_generated":\(snapshot.tokensGenerated),"avg_tokens_per_sec":\(String(format: "%.2f", snapshot.avgTokensPerSec))}\(partitionJson)}
+{"status":"ok","model":"\(modelId)","vision":\(loadedAsVision),"memory":{"active_mb":\(activeMemMB),"peak_mb":\(peakMemMB),"cache_mb":\(cacheMemMB),"limit_mb":\(allocationLimitMB),"total_system_mb":\(totalMemMB),"gpu_architecture":"\(deviceInfo.architecture)"},"stats":{"requests_total":\(snapshot.requestsTotal),"requests_active":\(snapshot.requestsActive),"tokens_generated":\(snapshot.tokensGenerated),"avg_tokens_per_sec":\(String(format: "%.2f", snapshot.avgTokensPerSec))}\(partitionJson)}
 """
             return Response(
                 status: .ok,
