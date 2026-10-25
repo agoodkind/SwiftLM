@@ -62,6 +62,65 @@ final class OwnFeatureHTTPTests: XCTestCase {
     XCTAssertLessThan(health.memory.peakMB, 64)
   }
 
+  func testCompletedNonStreamingRequestsReusePromptCache() async throws {
+    try await assertCompletedRequestsReusePromptCache(streaming: false)
+  }
+
+  func testCompletedStreamingRequestsReusePromptCache() async throws {
+    try await assertCompletedRequestsReusePromptCache(streaming: true)
+  }
+
+  private func assertCompletedRequestsReusePromptCache(streaming: Bool) async throws {
+    let checkpoint = try await makeCheckpoint()
+    let logURL: URL
+    do {
+      let server = try await startServer(checkpoint: checkpoint.directory, memoryLimitMB: 64)
+      defer { server.stop() }
+      let first = try await server.chat(streaming: streaming, logprobs: false)
+      let second = try await server.chat(streaming: streaming, logprobs: false)
+      XCTAssertEqual(try responseText(first, streaming: streaming), "AAA")
+      XCTAssertEqual(try responseText(second, streaming: streaming), "AAA")
+      let health = try await server.health()
+      XCTAssertLessThan(health.memory.peakMB, 64)
+      logURL = server.logURL
+    }
+    let output = try String(contentsOf: logURL, encoding: .utf8)
+    let pattern = try NSRegularExpression(
+      pattern: "Prompt cache HIT: ([0-9]+)/([0-9]+) tokens reused")
+    let matches = pattern.matches(in: output, range: NSRange(output.startIndex..., in: output))
+    XCTAssertEqual(matches.count, 1, "The second request must reuse its completed prompt: \(output)")
+    let match = try XCTUnwrap(matches.first)
+    let reusedRange = try XCTUnwrap(Range(match.range(at: 1), in: output))
+    let promptRange = try XCTUnwrap(Range(match.range(at: 2), in: output))
+    let reused = try XCTUnwrap(Int(output[reusedRange]))
+    let prompt = try XCTUnwrap(Int(output[promptRange]))
+    XCTAssertGreaterThan(reused, 0)
+    XCTAssertEqual(reused, prompt)
+  }
+
+  private func responseText(_ response: Data, streaming: Bool) throws -> String {
+    if !streaming {
+      let reply = try JSONDecoder().decode(ChatReply.self, from: response)
+      return try XCTUnwrap(reply.choices.first?.message?.content)
+    }
+    let body = String(decoding: response, as: UTF8.self)
+    var text = ""
+    var completed = false
+    for raw in body.components(separatedBy: "\n") {
+      let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard line.hasPrefix("data: ") else { continue }
+      let payload = String(line.dropFirst(6))
+      if payload == "[DONE]" {
+        completed = true
+        continue
+      }
+      let event = try JSONDecoder().decode(ChatReply.self, from: Data(payload.utf8))
+      text += event.choices.compactMap { $0.delta?.content }.joined()
+    }
+    XCTAssertTrue(completed, "The streaming response must finish: \(body)")
+    return text
+  }
+
   func testExplicitMemoryLimitAndHTTPLogprobsUseActualCheckpoint() async throws {
     let checkpoint = try await makeCheckpoint()
     let server = try await startServer(checkpoint: checkpoint.directory, memoryLimitMB: 64)
