@@ -33,9 +33,9 @@ jobs:
 
       - name: Verify the fixed Swift dependency bump command
         id: maintenance
-        uses: agoodkind/lmd/.github/actions/setup-maintenance@12bebcd05bf2dca0110bca6e9eab818d6f664f55
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@426e79c9358c0d0d16f2b786acba7a93ffc9fc9c
         with:
-          ref: '12bebcd05bf2dca0110bca6e9eab818d6f664f55'
+          ref: '426e79c9358c0d0d16f2b786acba7a93ffc9fc9c'
           test-filter: DependencyBumpTests
 
       - name: Prepare a dependency branch for manual review
