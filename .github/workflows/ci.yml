@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       run_pretrained_smoke:
-        description: Download pretrained models and run the modality smoke tests
+        description: Download pretrained models and run modality and SwiftBuddy tests
         type: boolean
         default: false
       run_speculative_smoke:
@@ -50,7 +50,28 @@ jobs:
         configuration: [debug, release]
     env:
       CONFIGURATION: ${{ matrix.configuration }}
+      SWIFTBUDDY_LOCAL_CLASSES: >-
+        AudioExtractionTests AudioFusionTests AudioTTSTests ChatToolsTests
+        ContextWindowCalculationTests ExtractionServiceTests GraphPalaceTests
+        LocalModelDirectoryTests MemoryPalaceServiceTests ModelArchitectureProbeTests
+        ModelLifecycleTests ModelStorageCacheTests ModelStorageLayoutTests
+        ProjectMinerTests Tier6AdvancedTests VLMExtractionTests VLMProcessorTests VLMRegistryTests
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -154,6 +175,37 @@ jobs:
             "$RUNNER_TEMP/swiftlm-runtime.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
             SwiftLMTests OwnFeatureHTTPTests
 
+      - name: Run SwiftBuddy tests with local data
+        env:
+          HF_HOME: ${{ runner.temp }}/swiftbuddy-model-loading-harness
+          HF_HUB_CACHE: ${{ runner.temp }}/swiftbuddy-model-loading-harness/hub
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
+        run: |
+          set -o pipefail
+          read -r -a test_classes <<< "$SWIFTBUDDY_LOCAL_CLASSES"
+          printf -v class_pattern '%s|' "${test_classes[@]}"
+          class_pattern="${class_pattern%|}"
+          swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
+            -Xswiftc -enable-testing --disable-swift-testing --skip-build \
+            --filter "SwiftBuddyTests\.($class_pattern)" \
+            2>&1 | tee "$RUNNER_TEMP/swiftbuddy-local.log"
+          node .github/scripts/verify-integration-results.mjs swiftpm \
+            "$RUNNER_TEMP/swiftbuddy-local.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
+            "${test_classes[@]}"
+
+      - name: Run manual SwiftBuddy model and network tests
+        if: github.event_name == 'workflow_dispatch' && inputs.run_pretrained_smoke && matrix.configuration == 'release'
+        run: |
+          set -o pipefail
+          swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
+            -Xswiftc -enable-testing --disable-swift-testing --skip-build \
+            --filter 'SwiftBuddyTests\.(AudioSTTTests|AudioTests|E2EIntegrationTests|HFModelSearchTests|VLMTests)' \
+            2>&1 | tee "$RUNNER_TEMP/swiftbuddy-manual.log"
+          node .github/scripts/verify-integration-results.mjs swiftpm \
+            "$RUNNER_TEMP/swiftbuddy-manual.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
+            AudioSTTTests AudioTests E2EIntegrationTests HFModelSearchTests VLMTests
+
       - name: Prepare the tested executable artifact
         run: |
           mkdir -p "$RUNNER_TEMP/swiftlm-artifact"
@@ -188,6 +240,73 @@ jobs:
             ${{ runner.temp }}/swiftlm-discovery.txt
             ${{ runner.temp }}/swiftlm-discovery-errors.txt
             ${{ runner.temp }}/swiftlm-runtime.log
+            ${{ runner.temp }}/swiftbuddy-local.log
+            ${{ runner.temp }}/swiftbuddy-manual.log
+          if-no-files-found: error
+          retention-days: 14
+
+  local_fixtures:
+    name: Local checkpoint E2E tests
+    needs: build_and_unit_test
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Download the tested Release executable and shaders
+        uses: actions/download-artifact@v4
+        with:
+          name: swiftlm-native-release
+          path: .build/release/
+
+      - name: Verify the tested source and shader artifact
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
+
+      - name: Run every committed tiny checkpoint
+        run: |
+          set -o pipefail
+          bash tests/test-fixtures.sh "$GITHUB_WORKSPACE/.build/release/SwiftLM" 15460 \
+            2>&1 | tee "$RUNNER_TEMP/swiftlm-fixtures.log"
+          grep -F 'Results: 7 passed, 0 failed' "$RUNNER_TEMP/swiftlm-fixtures.log"
+
+      - name: Upload checkpoint test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swiftlm-local-fixtures
+          path: |
+            ${{ runner.temp }}/swiftlm-fixtures.log
+            /tmp/SwiftLM-test-fixture-*.log
           if-no-files-found: error
           retention-days: 14
 
@@ -222,16 +341,6 @@ jobs:
             models: mlx-community/Qwen2-VL-2B-Instruct-4bit LiquidAI/LFM2.5-VL-450M-MLX-4bit@10ce3604e42cd595497c47aaf67b7890e1e2a3b4
           - modality: audio
             models: mlx-community/gemma-4-e4b-it-4bit
-          - modality: graph
-            models: ""
-          # Synthetic checkpoints committed to the repository, a few hundred KB each,
-          # so this entry downloads nothing and needs no model cache. It covers the
-          # weight-and-config shapes behind #118, #120 and the b674 regression — the
-          # class of defect #128 found the unit suite has never caught, and which real
-          # checkpoints are too large to cover here (gemma-4-e2b alone is 3.6 GB
-          # against a 10 GB per-repository cache budget).
-          - modality: fixtures
-            models: ""
           # OpenAI-compatibility contract: what the client receives over the wire, once
           # real tokenisation decides chunk boundaries. Runs on the smallest model —
           # these assert server behaviour, not model quality (issue #128).
@@ -255,6 +364,21 @@ jobs:
           - modality: opencode
             models: mlx-community/gemma-4-e4b-it-4bit
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -332,6 +456,21 @@ jobs:
     timeout-minutes: 45
     needs: build_and_unit_test  # Run in parallel with integration_matrix
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -408,6 +547,21 @@ jobs:
     timeout-minutes: 45
     needs: build_and_unit_test
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -486,6 +640,21 @@ jobs:
     needs: build_and_unit_test
     continue-on-error: true
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -606,6 +775,21 @@ jobs:
     timeout-minutes: 45
     needs: build_and_unit_test
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive

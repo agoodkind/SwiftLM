@@ -62,7 +62,7 @@ run_fixture() {
         return
     fi
 
-    "$BINARY" --model "$dir" --port "$PORT" --host "$HOST" > "$logfile" 2>&1 &
+    "$BINARY" --model "$dir" --port "$PORT" --host "$HOST" --mem-limit 64 > "$logfile" 2>&1 &
     SERVER_PID=$!
 
     # Liveness is checked *before* the health probe on purpose. The other order lets a
@@ -130,7 +130,7 @@ done
 log "Shape: moe-nested (nested expert count is detected)"
 MOE_LOG="/tmp/SwiftLM-test-fixture-moe-stream.log"
 "$BINARY" --model "$FIXTURE_DIR/moe-nested" --port "$PORT" --host "$HOST" \
-    --stream-experts > "$MOE_LOG" 2>&1 &
+    --stream-experts --mem-limit 64 > "$MOE_LOG" 2>&1 &
 SERVER_PID=$!
 ready=0
 for _ in $(seq 1 60); do
