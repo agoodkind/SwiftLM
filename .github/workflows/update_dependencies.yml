@@ -1,19 +1,7 @@
 name: Dependency Automation
 
-# Prepares a submodule bump when mlx-swift or mlx-swift-lm cuts a release, and stops
-# at a pushed branch rather than opening a pull request.
-#
-# Opening the PR from a workflow needs a personal access token, because GitHub does
-# not start workflow runs for events raised by GITHUB_TOKEN. A bot-opened PR would
-# therefore arrive with no checks at all — permanently pending, never green — and this
-# repository gates releases on CI concluding successfully (see release.yml). A branch
-# is the honest stopping point: opening the PR yourself takes one click, and CI then
-# runs normally because the event is yours.
-#
-# That a human sees the bump before it merges is a feature. Bumps here have needed a
-# pointer check, an umbrella build and a smoke test to be trustworthy; the automation
-# does the mechanical part and leaves the judgement.
-
+# Prepare a bump branch for a person to review and open as a pull request.
+# GITHUB_TOKEN opened, synchronize, and reopened pull request events require approval.
 on:
   repository_dispatch:
     types: [dependency_bump]
@@ -66,7 +54,7 @@ jobs:
       - name: Move submodule to the released tag
         run: |
           set -euo pipefail
-          git -C "$SOURCE_REPO" fetch --tags --force origin
+          git -C "$SOURCE_REPO" fetch --tags origin
           if ! git -C "$SOURCE_REPO" rev-parse -q --verify "refs/tags/${NEW_TAG}^{commit}" >/dev/null; then
             echo "::error::tag $NEW_TAG does not exist in $SOURCE_REPO"
             exit 1
@@ -91,40 +79,41 @@ jobs:
             echo "\`$SOURCE_REPO\` is already at \`$NEW_TAG\` (\`${AFTER_SHA:0:7}\`)."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Push the bump branch
+      - name: Push a new bump branch
         if: env.ALREADY_CURRENT != '1'
         run: |
           set -euo pipefail
-          branch="auto-update/${SOURCE_REPO}-${NEW_TAG}"
-          git checkout -B "$branch"
+          branch="auto-update/$SOURCE_REPO-$NEW_TAG"
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch"; then
+            echo "::error::Branch $branch already exists. Review its commits before updating it manually."
+            exit 1
+          else
+            status=$?
+            if [[ "$status" -ne 2 ]]; then
+              echo "::error::Cannot inspect the existing remote branch. Git exited with status $status."
+              exit "$status"
+            fi
+            echo "The remote does not contain $branch."
+          fi
+          git checkout -b "$branch"
           git add "$SOURCE_REPO"
           git \
             -c user.name='github-actions[bot]' \
             -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m "chore(deps): bump $SOURCE_REPO to $NEW_TAG
-
-          Moves the $SOURCE_REPO submodule from ${BEFORE_SHA:0:7} to ${AFTER_SHA:0:7},
-          the commit tagged $NEW_TAG.
-
-          Prepared automatically; opened by hand so that CI runs against it."
-          # The auto-update/* namespace belongs to this workflow, so replacing a branch
-          # left by an earlier run for the same tag is safe and keeps re-runs idempotent.
-          git push --force origin "$branch"
+            commit -m "Update $SOURCE_REPO submodule to $NEW_TAG"
+          git push origin "HEAD:refs/heads/$branch"
           echo "BUMP_BRANCH=$branch" >> "$GITHUB_ENV"
 
-      - name: Summarise, with a link that opens the pull request
+      - name: Link to the new pull request form
         if: env.ALREADY_CURRENT != '1'
         run: |
           {
-            echo "### \`$SOURCE_REPO\` → \`$NEW_TAG\` is ready"
+            echo "### Review the dependency update"
             echo
-            echo "Branch \`$BUMP_BRANCH\` pushed, moving the submodule from"
-            echo "\`${BEFORE_SHA:0:7}\` to \`${AFTER_SHA:0:7}\`."
+            echo "Branch \`$BUMP_BRANCH\` updates \`$SOURCE_REPO\` from \`$BEFORE_SHA\` to \`$AFTER_SHA\`."
             echo
-            echo "**[Open the pull request](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${BUMP_BRANCH}?expand=1)**"
+            echo "[Open the pull request]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BUMP_BRANCH?expand=1)"
             echo
-            echo "No PR is opened here on purpose: GitHub does not start workflow runs"
-            echo "for events raised by \`GITHUB_TOKEN\`, so a bot-opened PR would never"
-            echo "get CI. Opening it yourself gets the checks this repository gates"
-            echo "releases on."
+            echo "This workflow does not open pull requests. A person must review and open the branch."
+            echo "Pull requests opened with GITHUB_TOKEN create workflow runs that require approval."
           } >> "$GITHUB_STEP_SUMMARY"
