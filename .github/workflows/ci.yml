@@ -88,6 +88,10 @@ jobs:
       core_ref: ${{ needs.lmd_sources.outputs.core_ref }}
       library_ref: ${{ needs.lmd_sources.outputs.library_ref }}
       swiftlm_ref: ${{ needs.lmd_sources.outputs.swiftlm_ref }}
+      core_profile: ${{ needs.lmd_sources.outputs.core_ref == '786724757aa480f049d3a913c59da7e0e61ad5dc' && 'core-runtime-7867247' || '' }}
+      library_profile: ${{ needs.lmd_sources.outputs.library_ref == '60054f77f91bc3e77c44950054dd6a9b53359352' && 'library-runtime-60054f7' || '' }}
+    secrets:
+      LOCAL_POOL_CAPACITY_TOKEN: ${{ secrets.LOCAL_POOL_CAPACITY_TOKEN }}
 
   lmd_integration:
     name: LMD Integration
@@ -148,10 +152,6 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
       - name: Verify the checked out source revisions
         run: |
           git rev-parse HEAD > "$RUNNER_TEMP/swiftlm.sha"
@@ -165,6 +165,12 @@ jobs:
           cat "$RUNNER_TEMP/cohort-sources.txt" >> "$GITHUB_STEP_SUMMARY"
           swift --version
           xcodebuild -version
+
+      - name: Set up Swift result verification
+        id: maintenance
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@e489ade9f90bf4105539b4a0ebf2503cbde5f20b
+        with:
+          ref: 'e489ade9f90bf4105539b4a0ebf2503cbde5f20b'
 
       - name: Cache dependency source
         uses: actions/cache@v4
@@ -242,7 +248,7 @@ jobs:
           swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
             -Xswiftc -enable-testing --disable-swift-testing --skip-build --filter SwiftLMTests \
             2>&1 | tee "$RUNNER_TEMP/swiftlm-runtime.log"
-          node .github/scripts/verify-integration-results.mjs swiftpm \
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results swiftpm \
             "$RUNNER_TEMP/swiftlm-runtime.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
             SwiftLMTests OwnFeatureHTTPTests
 
@@ -261,7 +267,7 @@ jobs:
             -Xswiftc -enable-testing --disable-swift-testing --skip-build \
             --filter "SwiftBuddyTests\.($class_pattern)" \
             2>&1 | tee "$RUNNER_TEMP/swiftbuddy-local.log"
-          node .github/scripts/verify-integration-results.mjs swiftpm \
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results swiftpm \
             "$RUNNER_TEMP/swiftbuddy-local.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
             "${test_classes[@]}"
 
@@ -273,7 +279,7 @@ jobs:
             -Xswiftc -enable-testing --disable-swift-testing --skip-build \
             --filter 'SwiftBuddyTests\.(AudioSTTTests|AudioTests|E2EIntegrationTests|HFModelSearchTests|VLMTests)' \
             2>&1 | tee "$RUNNER_TEMP/swiftbuddy-manual.log"
-          node .github/scripts/verify-integration-results.mjs swiftpm \
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results swiftpm \
             "$RUNNER_TEMP/swiftbuddy-manual.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
             AudioSTTTests AudioTests E2EIntegrationTests HFModelSearchTests VLMTests
 

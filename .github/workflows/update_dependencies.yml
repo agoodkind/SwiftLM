@@ -1,7 +1,6 @@
 name: Dependency Automation
 
 # Prepare a bump branch for a person to review and open as a pull request.
-# GITHUB_TOKEN opened, synchronize, and reopened pull request events require approval.
 on:
   repository_dispatch:
     types: [dependency_bump]
@@ -9,111 +8,40 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   bump-dependencies:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: swift:6.3.2-noble@sha256:c4336909a71b2e69b884f4078cdf98c0cd081911632cb349ef72abc4cbed69fc
+    timeout-minutes: 60
     steps:
-      - name: Checkout Code
+      - name: Refresh Ubuntu package metadata
+        run: apt-get update
+
+      - name: Install portable build prerequisites
+        run: apt-get install --yes --no-install-recommends make curl
+
+      - name: Checkout the candidate repository
         uses: actions/checkout@v4
         with:
+          path: candidate
           submodules: recursive
           fetch-depth: 0
 
-      # client_payload is attacker-controlled in principle — anything able to dispatch
-      # to this repository chooses these strings — and they end up in shell and in a
-      # ref name. Validate them here and pass them onward through the environment
-      # rather than interpolating ${{ }} into a run block, where a crafted tag would
-      # be executed rather than compared.
-      - name: Validate dispatch payload
+      - name: Verify the fixed Swift dependency bump command
+        id: maintenance
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@e489ade9f90bf4105539b4a0ebf2503cbde5f20b
+        with:
+          ref: 'e489ade9f90bf4105539b4a0ebf2503cbde5f20b'
+          test-filter: DependencyBumpTests
+
+      - name: Prepare a dependency branch for manual review
+        id: bump
         env:
+          MAINTENANCE_BIN: ${{ steps.maintenance.outputs.binary }}
           PAYLOAD_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
           PAYLOAD_NEW_TAG: ${{ github.event.client_payload.new_tag }}
-        run: |
-          set -euo pipefail
-          case "$PAYLOAD_SOURCE_REPO" in
-            mlx-swift|mlx-swift-lm) ;;
-            *)
-              echo "::error::unexpected source_repo '$PAYLOAD_SOURCE_REPO' — expected mlx-swift or mlx-swift-lm"
-              exit 1
-              ;;
-          esac
-          if ! printf '%s' "$PAYLOAD_NEW_TAG" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
-            echo "::error::refusing tag '$PAYLOAD_NEW_TAG' — not a plain tag name"
-            exit 1
-          fi
-          {
-            echo "SOURCE_REPO=$PAYLOAD_SOURCE_REPO"
-            echo "NEW_TAG=$PAYLOAD_NEW_TAG"
-          } >> "$GITHUB_ENV"
-
-      # Both dependencies are `.package(path: "./…")` in Package.swift, backed by git
-      # submodules, so bumping either one is a pointer move. `swift package update`
-      # does nothing for a path dependency — SwiftPM takes whatever is on disk — which
-      # is why the mlx-swift branch of the previous version of this workflow could only
-      # ever have produced an empty commit.
-      - name: Move submodule to the released tag
-        run: |
-          set -euo pipefail
-          git -C "$SOURCE_REPO" fetch --tags origin
-          if ! git -C "$SOURCE_REPO" rev-parse -q --verify "refs/tags/${NEW_TAG}^{commit}" >/dev/null; then
-            echo "::error::tag $NEW_TAG does not exist in $SOURCE_REPO"
-            exit 1
-          fi
-          before=$(git rev-parse "HEAD:$SOURCE_REPO")
-          git -C "$SOURCE_REPO" checkout --detach "refs/tags/$NEW_TAG"
-          after=$(git -C "$SOURCE_REPO" rev-parse HEAD)
-          {
-            echo "BEFORE_SHA=$before"
-            echo "AFTER_SHA=$after"
-          } >> "$GITHUB_ENV"
-          if [ "$before" = "$after" ]; then
-            echo "ALREADY_CURRENT=1" >> "$GITHUB_ENV"
-          fi
-
-      - name: Report an already-current submodule and stop
-        if: env.ALREADY_CURRENT == '1'
-        run: |
-          {
-            echo "### Nothing to bump"
-            echo
-            echo "\`$SOURCE_REPO\` is already at \`$NEW_TAG\` (\`${AFTER_SHA:0:7}\`)."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Push a new bump branch
-        if: env.ALREADY_CURRENT != '1'
-        run: |
-          set -euo pipefail
-          branch="auto-update/$SOURCE_REPO-$NEW_TAG"
-          if git ls-remote --exit-code --heads origin "refs/heads/$branch"; then
-            echo "::error::Branch $branch already exists. Review its commits before updating it manually."
-            exit 1
-          else
-            status=$?
-            if [[ "$status" -ne 2 ]]; then
-              echo "::error::Cannot inspect the existing remote branch. Git exited with status $status."
-              exit "$status"
-            fi
-            echo "The remote does not contain $branch."
-          fi
-          git checkout -b "$branch"
-          git add "$SOURCE_REPO"
-          git \
-            -c user.name='github-actions[bot]' \
-            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m "Update $SOURCE_REPO submodule to $NEW_TAG"
-          git push origin "HEAD:refs/heads/$branch"
-          echo "BUMP_BRANCH=$branch" >> "$GITHUB_ENV"
-
-      - name: Link to the new pull request form
-        if: env.ALREADY_CURRENT != '1'
-        run: |
-          {
-            echo "### Review the dependency update"
-            echo
-            echo "Branch \`$BUMP_BRANCH\` updates \`$SOURCE_REPO\` from \`$BEFORE_SHA\` to \`$AFTER_SHA\`."
-            echo
-            echo "[Open the pull request]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BUMP_BRANCH?expand=1)"
-            echo
-            echo "This workflow does not open pull requests. A person must review and open the branch."
-            echo "Pull requests opened with GITHUB_TOKEN create workflow runs that require approval."
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: '"$MAINTENANCE_BIN" bump-dependency "$GITHUB_WORKSPACE/candidate"'
