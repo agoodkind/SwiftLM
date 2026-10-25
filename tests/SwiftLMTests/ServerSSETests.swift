@@ -46,7 +46,9 @@ final class ServerSSETests: XCTestCase {
         XCTAssertEqual(json["n_prompt_tokens"] as? Int, 128)
         XCTAssertEqual(json["elapsed_seconds"] as? Int, 4)
         XCTAssertNil(json["object"])
-        XCTAssertNil(json["choices"])
+        // Issue #168: empty choices keeps strict OpenAI chunk validators (opencode) happy
+        // even when they validate every data: line regardless of event name.
+        XCTAssertEqual((json["choices"] as? [Any])?.count, 0)
     }
 
     // MARK: - 1b: Zero-token boundary (no divide-by-zero crash)
@@ -93,7 +95,24 @@ final class ServerSSETests: XCTestCase {
         XCTAssertNil(json["id"],      "prefill chunk must not carry an id field")
         XCTAssertNil(json["object"],  "prefill chunk must not carry an object field")
         XCTAssertNil(json["model"],   "prefill chunk must not carry a model field")
-        XCTAssertNil(json["choices"], "prefill chunk must not carry a choices field")
+        // Issue #168: choices must be present but empty — opencode's chunk union
+        // requires `choices` (or `error`); omitting it fails type validation.
+        XCTAssertEqual((json["choices"] as? [Any])?.count, 0,
+                       "prefill chunk must carry an empty choices array")
+    }
+
+    // MARK: - Issue #168: empty choices is what strict validators require
+
+    func testPrefillChunk_ChoicesIsEmptyArrayForStrictValidators() throws {
+        let chunk = ssePrefillChunk(nPast: 1, promptTokens: 4, elapsedSeconds: 1)
+        let prefix = "event: prefill_progress\r\ndata: "
+        let suffix = "\r\n\r\n"
+        let payload = String(chunk.dropFirst(prefix.count).dropLast(suffix.count))
+        let data = try XCTUnwrap(payload.data(using: .utf8))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        let choices = try XCTUnwrap(json["choices"] as? [Any], "choices must be present")
+        XCTAssertTrue(choices.isEmpty)
     }
 
     // MARK: - 1e: PrefillState.finish() is idempotent (Issue #2 guard)
@@ -119,5 +138,63 @@ final class ServerSSETests: XCTestCase {
         // The heartbeat loop reads nPast only when !done, so its value after finish
         // is irrelevant to correctness. We capture the current contract here.
         // If a post-done guard is added later, add XCTAssertNotEqual(await state.nPast, 999).
+    }
+
+    // MARK: - Error event stays valid JSON for any message text
+
+    private struct MessyError: Error, CustomStringConvertible {
+        let description = "bad \"quote\", back\\slash\nnew line"
+    }
+
+    func testErrorChunkEncodesMessageAsValidJSON() throws {
+        let chunk = sseErrorChunk(MessyError())
+
+        let prefix = "data: "
+        let suffix = "\r\n\r\n"
+        XCTAssertTrue(chunk.hasPrefix(prefix))
+        XCTAssertTrue(chunk.hasSuffix(suffix))
+
+        let payload = String(chunk.dropFirst(prefix.count).dropLast(suffix.count))
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        let err = try XCTUnwrap(obj["error"] as? [String: Any])
+        XCTAssertEqual(err["message"] as? String, MessyError().description)
+        XCTAssertEqual(err["type"] as? String, "server_error")
+        XCTAssertEqual(err["code"] as? String, "internal_error")
+    }
+
+    func testErrorJSONEncodesMessageAsValidJSON() throws {
+        let body = errorJSON(MessyError())
+
+        let obj = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any])
+        let err = try XCTUnwrap(obj["error"] as? [String: Any])
+        XCTAssertEqual(err["message"] as? String, MessyError().description)
+        XCTAssertEqual(err["type"] as? String, "server_error")
+        XCTAssertEqual(err["code"] as? String, "internal_error")
+    }
+
+    // MARK: - Keepalive
+
+    /// A silent stream (long prefill, buffered tool call) must still carry bytes, as
+    /// SSE comments that parsers ignore, or Node/Bun clients abort it after ~300 s.
+    func testKeepaliveEmitsSSECommentsWhileStreamIsSilent() async {
+        let (stream, cont) = AsyncStream<String>.makeStream()
+        let task = startSSEKeepalive(cont, interval: .milliseconds(20))
+        var received: [String] = []
+        for await event in stream {
+            received.append(event)
+            if received.count == 2 { break }
+        }
+        task.cancel()
+        XCTAssertEqual(received, [": keepalive\r\n\r\n", ": keepalive\r\n\r\n"])
+    }
+
+    func testKeepaliveStopsWhenStreamFinishes() async {
+        let (_, cont) = AsyncStream<String>.makeStream()
+        let task = startSSEKeepalive(cont, interval: .milliseconds(10))
+        cont.finish()
+        // Returns on its own (yield reports .terminated), without being cancelled.
+        await task.value
     }
 }

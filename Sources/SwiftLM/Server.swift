@@ -22,6 +22,7 @@ import MLXLMCommon
 import MLXNN
 import MLXVLM
 import MLXInferenceCore
+import NIOCore
 import Tokenizers
 
 extension LMInput: @retroactive @unchecked Sendable {}
@@ -43,15 +44,183 @@ private struct HubDownloader: Downloader, Sendable {
 }
 
 private struct TransformersTokenizerLoader: TokenizerLoader, Sendable {
+    /// Carried purely so template diagnostics can name the offending checkpoint; the
+    /// on-disk directory is a snapshot hash and means nothing to the person reading it.
+    let modelId: String
+    init(modelId: String = "this model") { self.modelId = modelId }
+
     func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
-        let t = try await AutoTokenizer.from(modelFolder: directory)
-        return TransformersTokenizerBridge(t)
+        let unigramRemapped = Self.remappingUnigramTokenizerClassIfNeeded(in: directory, modelId: modelId)
+        let effectiveDirectory = remappingBPECompatibleTokenizerClassIfNeeded(in: unigramRemapped, modelId: modelId)
+        let t = try await AutoTokenizer.from(modelFolder: effectiveDirectory)
+        return TransformersTokenizerBridge(t, modelId: modelId)
+    }
+
+    /// swift-transformers' `TokenizerModel.from(...)` picks a concrete tokenizer
+    /// implementation purely from the `tokenizer_class` name string (its
+    /// `knownTokenizers` table) — it never inspects `tokenizer.json`'s own
+    /// `model.type`. After stripping a `"Fast"` suffix, `"PreTrainedTokenizerFast"`
+    /// becomes `"PreTrainedTokenizer"`, which the table maps explicitly to
+    /// `BPETokenizer`. When the checkpoint's actual `tokenizer.json` is Unigram
+    /// (SentencePiece-style — common for models trained from scratch with a custom
+    /// vocab, e.g. several Japanese LLM projects that build their own vocab and
+    /// save via `AutoTokenizer`/`PreTrainedTokenizerFast` without a dedicated
+    /// subclass), there is no `merges` field and `BPETokenizer` hits a
+    /// `fatalError` instead of throwing (SwiftLM#155, reported by @kei-Optim).
+    ///
+    /// Workaround until the fix lands upstream in `huggingface/swift-transformers`
+    /// (`TokenizerModel.from` should consult `tokenizer.json`'s `model.type` when
+    /// `tokenizer_class` is generic/unknown): if `tokenizer.json` declares a
+    /// Unigram model and `tokenizer_config.json`'s `tokenizer_class` isn't already
+    /// one of the table's Unigram-mapped names, build a scratch copy of the
+    /// checkpoint directory — original files referenced via symlink, so the HF
+    /// cache is untouched — with `tokenizer_config.json`'s `tokenizer_class`
+    /// rewritten to `"XLMRobertaTokenizer"`, which resolves to `UnigramTokenizer`.
+    /// Its `init(tokenizerConfig:tokenizerData:addedTokens:)` doesn't depend on the
+    /// class name itself, so the rewrite is otherwise inert.
+    private static func remappingUnigramTokenizerClassIfNeeded(
+        in directory: URL, modelId: String
+    ) -> URL {
+        let tokenizerDataURL = directory.appendingPathComponent("tokenizer.json")
+        let tokenizerConfigURL = directory.appendingPathComponent("tokenizer_config.json")
+        guard
+            let tokenizerData = try? Data(contentsOf: tokenizerDataURL),
+            let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],
+            (tokenizerJSON["model"] as? [String: Any])?["type"] as? String == "Unigram",
+            let configData = try? Data(contentsOf: tokenizerConfigURL),
+            var configJSON = try? JSONSerialization.jsonObject(with: configData) as? [String: Any]
+        else {
+            return directory
+        }
+
+        let unigramMappedClasses: Set<String> = [
+            "XLMRobertaTokenizer", "Xlm-RobertaTokenizer", "T5Tokenizer",
+        ]
+        let currentClass = (configJSON["tokenizer_class"] as? String)?
+            .replacingOccurrences(of: "Fast", with: "")
+        if let currentClass, unigramMappedClasses.contains(currentClass) {
+            return directory
+        }
+
+        let originalClassDescription = (configJSON["tokenizer_class"] as? String) ?? "unset"
+        let scratchDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swiftlm-unigram-tokenizer-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: scratchDirectory, withIntermediateDirectories: true)
+            let contents = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)
+            for fileURL in contents where fileURL.lastPathComponent != "tokenizer_config.json" {
+                try FileManager.default.createSymbolicLink(
+                    at: scratchDirectory.appendingPathComponent(fileURL.lastPathComponent),
+                    withDestinationURL: fileURL)
+            }
+            configJSON["tokenizer_class"] = "XLMRobertaTokenizer"
+            let rewritten = try JSONSerialization.data(
+                withJSONObject: configJSON, options: [.prettyPrinted])
+            try rewritten.write(to: scratchDirectory.appendingPathComponent("tokenizer_config.json"))
+        } catch {
+            // Scratch-directory setup is best-effort — fall through to the original
+            // directory rather than fail the whole load over a workaround failing.
+            return directory
+        }
+
+        print(
+            "[SwiftLM] \(modelId): tokenizer.json is Unigram but tokenizer_class is generic "
+                + "(\"\(originalClassDescription)\"); loading via a remapped tokenizer_class "
+                + "so it resolves to UnigramTokenizer instead of crashing in BPETokenizer.")
+        return scratchDirectory
+    }
+}
+
+/// `tokenizer_class` values that swift-transformers does not list in its `knownTokenizers`
+/// table but whose `tokenizer.json` is the same byte-level BPE as GPT-2, so `BPETokenizer`
+/// loads them correctly. Loading such a checkpoint otherwise fails with
+/// `unsupportedTokenizer("GPTNeoXTokenizer")` before the server starts (OLMoE, GPT-NeoX
+/// and Pythia derivatives).
+let bpeCompatibleTokenizerClasses: Set<String> = ["GPTNeoXTokenizer"]
+
+/// Returns `directory` unchanged unless its `tokenizer_class` is one of
+/// `bpeCompatibleTokenizerClasses` *and* `tokenizer.json` declares a BPE model. In that
+/// case it returns a scratch copy, original files symlinked so the HF cache is untouched,
+/// whose `tokenizer_config.json` says `GPT2Tokenizer`, which swift-transformers maps to
+/// `BPETokenizer`. Checking `model.type` keeps a mislabelled Unigram or WordPiece
+/// checkpoint from being forced into the BPE implementation.
+///
+/// Same mechanism as `TransformersTokenizerLoader.remappingUnigramTokenizerClassIfNeeded`;
+/// delete both once swift-transformers selects the implementation from `model.type`.
+func remappingBPECompatibleTokenizerClassIfNeeded(in directory: URL, modelId: String) -> URL {
+    let tokenizerDataURL = directory.appendingPathComponent("tokenizer.json")
+    let tokenizerConfigURL = directory.appendingPathComponent("tokenizer_config.json")
+    guard
+        let tokenizerData = try? Data(contentsOf: tokenizerDataURL),
+        let tokenizerJSON = try? JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any],
+        (tokenizerJSON["model"] as? [String: Any])?["type"] as? String == "BPE",
+        let configData = try? Data(contentsOf: tokenizerConfigURL),
+        var configJSON = try? JSONSerialization.jsonObject(with: configData) as? [String: Any],
+        let declared = configJSON["tokenizer_class"] as? String,
+        bpeCompatibleTokenizerClasses.contains(declared.replacingOccurrences(of: "Fast", with: ""))
+    else {
+        return directory
+    }
+
+    let scratchDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("swiftlm-bpe-tokenizer-\(UUID().uuidString)", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
+        let contents = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        for fileURL in contents where fileURL.lastPathComponent != "tokenizer_config.json" {
+            try FileManager.default.createSymbolicLink(
+                at: scratchDirectory.appendingPathComponent(fileURL.lastPathComponent),
+                withDestinationURL: fileURL)
+        }
+        configJSON["tokenizer_class"] = "GPT2Tokenizer"
+        let rewritten = try JSONSerialization.data(withJSONObject: configJSON, options: [.prettyPrinted])
+        try rewritten.write(to: scratchDirectory.appendingPathComponent("tokenizer_config.json"))
+    } catch {
+        // Best-effort, as for the Unigram remap: fall back to the original directory and
+        // let the loader report its own error.
+        return directory
+    }
+
+    print("[SwiftLM] \(modelId): tokenizer_class \"\(declared)\" is not in swift-transformers' table; "
+        + "tokenizer.json is byte-level BPE, so loading it as GPT2Tokenizer.")
+    return scratchDirectory
+}
+
+/// A chat template that the Jinja parser rejected.
+///
+/// Worth its own type because the underlying error says only what the parser choked on
+/// — `parser('Unexpected token type: closeExpression')` — with no hint that the subject
+/// is a file shipped inside someone else's checkpoint. A model published with a
+/// malformed template loads fine, starts fine, and then fails every request, which
+/// reads as "the server is broken" rather than "this checkpoint is broken". That
+/// happened for real: LiquidAI republished LFM2.5-VL-450M-MLX-4bit with
+/// `{- bos_token -}}` (one brace short) and identifying it took a bisect across two
+/// model revisions.
+struct MalformedChatTemplate: Error, CustomStringConvertible {
+    let modelId: String
+    let underlying: String
+
+    var description: String {
+        """
+        The chat template shipped with \(modelId) is not valid Jinja and could not be \
+        parsed: \(underlying). This is a defect in the model's chat_template.jinja (or \
+        the chat_template field of its tokenizer_config.json), not in the request — \
+        report it to whoever publishes the checkpoint. Pinning to an earlier revision \
+        of the model is the usual workaround.
+        """
     }
 }
 
 private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
     let upstream: any Tokenizers.Tokenizer
-    init(_ upstream: any Tokenizers.Tokenizer) { self.upstream = upstream }
+    /// Only used to name the model in template diagnostics.
+    let modelId: String
+    init(_ upstream: any Tokenizers.Tokenizer, modelId: String = "this model") {
+        self.upstream = upstream
+        self.modelId = modelId
+    }
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
         upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
     }
@@ -69,11 +238,87 @@ private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
         do {
+            // Issue #168: JSON `null` in tool schemas decodes to NSNull via AnyCodable.
+            // swift-jinja's Value.init(any:) has no NSNull case, so a single null anywhere
+            // in a tool spec aborted the whole render with a misleading "Optional<Any>"
+            // conversion error that was then mislabeled as a broken template. Strip nulls
+            // (and unwrap nested optionals) before handing anything to the template engine.
             return try upstream.applyChatTemplate(
-                messages: messages, tools: tools, additionalContext: additionalContext)
+                messages: messages.map { $0.mapValuesDeep(sanitizeForJinja) },
+                tools: tools?.map { $0.mapValuesDeep(sanitizeForJinja) },
+                additionalContext: additionalContext.map { $0.mapValuesDeep(sanitizeForJinja) })
         } catch Tokenizers.TokenizerError.missingChatTemplate {
             throw MLXLMCommon.TokenizerError.missingChatTemplate
+        } catch {
+            // A missing template is a legitimate state (base models have none) and keeps
+            // its own error above. Anything else here means the template exists but the
+            // parser would not take it, which is worth naming precisely.
+            throw MalformedChatTemplate(
+                modelId: modelId, underlying: String(describing: error))
         }
+    }
+}
+
+/// Returns `nil` when the value must be dropped (JSON `null` / NSNull), otherwise a
+/// structure with every nested null removed. See `TransformersTokenizerBridge.applyChatTemplate`.
+/// True when a VLM load failed because the checkpoint doesn't match the VLM code:
+/// its config doesn't decode, its weights don't line up with the module tree, or the
+/// factory doesn't know the model/processor type. Only these justify retrying an
+/// auto-detected VLM as a text-only LLM. Anything else (cancellation, download, I/O)
+/// would fail the same way again and just hide the real error.
+func isVLMCheckpointMismatch(_ error: any Error) -> Bool {
+    switch error {
+    case is DecodingError, is UpdateError:
+        return true
+    case let factoryError as ModelFactoryError:
+        switch factoryError {
+        case .unsupportedModelType, .unsupportedProcessorType, .configurationDecodingError,
+            .invalidConfiguration:
+            return true
+        default:
+            return false
+        }
+    default:
+        return false
+    }
+}
+
+/// One-shot flags for TurboKV configuration notices.
+enum TurboKVNotice {
+    nonisolated(unsafe) static var warnedNoLayers = false
+}
+
+func sanitizeForJinja(_ value: any Sendable) -> (any Sendable)? {
+    if value is NSNull { return nil }
+    let mirror = Mirror(reflecting: value)
+    if mirror.displayStyle == .optional {
+        guard let child = mirror.children.first else { return nil }
+        return sanitizeForJinja(child.value as any Sendable)
+    }
+    if let dict = value as? [String: Any] {
+        var out: [String: any Sendable] = [:]
+        for (key, val) in dict {
+            if let cleaned = sanitizeForJinja(val as any Sendable) {
+                out[key] = cleaned
+            }
+        }
+        return out
+    }
+    if let arr = value as? [Any] {
+        return arr.compactMap { sanitizeForJinja($0 as any Sendable) }
+    }
+    return value
+}
+
+extension Dictionary where Key == String, Value == any Sendable {
+    func mapValuesDeep(_ transform: (any Sendable) -> (any Sendable)?) -> [String: any Sendable] {
+        var out: [String: any Sendable] = [:]
+        for (key, val) in self {
+            if let cleaned = transform(val) {
+                out[key] = cleaned
+            }
+        }
+        return out
     }
 }
 
@@ -88,9 +333,30 @@ final class ProgressTracker {
     private var lastUpdate: TimeInterval = 0
     private var lastBytes: Int64 = 0
     private var speedStr = "0.0 MB/s"
+    private var progress: Progress?
     
     init(modelId: String) {
         self.modelId = modelId
+    }
+
+    /// True while a `\r` progress bar is on screen without its closing newline.
+    nonisolated(unsafe) static var barOpen = false
+
+    /// Stops redrawing and ends the bar's line, so later output (and the `exiting`
+    /// event, which the daemon parses per line) starts on a fresh line.
+    func finish() {
+        isDone = true
+        trackingTask?.cancel()
+        if Self.barOpen {
+            // The Task may be cancelled before its last frame; show where it ended.
+            if let progress {
+                print(frame(fraction: progress.fractionCompleted).padding(
+                    toLength: 100, withPad: " ", startingAt: 0), terminator: "")
+            }
+            print("")
+            fflush(stdout)
+            Self.barOpen = false
+        }
     }
     
     func getDownloadedBytes() -> Int64 {
@@ -116,7 +382,37 @@ final class ProgressTracker {
         return sumDir(modelHubDir) + sumDir(downloadDir)
     }
     
+    /// One `\r` frame of the download bar at `fraction`.
+    private func frame(fraction: Double) -> String {
+        let pct = Int(fraction * 100)
+        var completedMB = String(format: "%.1f", Double(self.lastBytes) / 1_048_576)
+        var totalMB = "???"
+        if fraction > 0.001 {
+            let extrapolated = (Double(self.lastBytes) / fraction) / 1_048_576.0
+            totalMB = String(format: "%.1f", extrapolated)
+        } else if fraction == 0.0 {
+             completedMB = "0.0"
+        }
+
+        let barLength = 20
+        let completedBars = min(barLength, Int(fraction * Double(barLength)))
+        let emptyBars = max(0, barLength - completedBars)
+
+        var bars = ""
+        if completedBars > 0 {
+            bars += String(repeating: "=", count: completedBars - 1) + ">"
+        }
+        bars += String(repeating: " ", count: emptyBars)
+
+        let pctStr = String(format: "%3d%%", pct)
+        let spinner = self.spinnerFrames[self.frameIndex]
+        let speedText = "| Speed: \(self.speedStr)"
+
+        return String(format: "\r[SwiftLM] Download: [%@] %@ %@ (%@ MB / %@ MB) %@", bars, pctStr, spinner, completedMB, totalMB, speedText)
+    }
+
     func printProgress(_ progress: Progress) {
+        self.progress = progress
         if trackingTask == nil {
             lastUpdate = Date().timeIntervalSince1970
             lastBytes = getDownloadedBytes()
@@ -125,7 +421,6 @@ final class ProgressTracker {
                 while !self.isDone && !Task.isCancelled {
                     let now = Date().timeIntervalSince1970
                     let fraction = progress.fractionCompleted
-                    let pct = Int(fraction * 100)
                     
                     let interval = now - self.lastUpdate
                     if interval >= 0.25 {
@@ -144,36 +439,16 @@ final class ProgressTracker {
                         self.lastUpdate = now
                     }
                     
-                    var completedMB = String(format: "%.1f", Double(self.lastBytes) / 1_048_576)
-                    var totalMB = "???"
-                    if fraction > 0.001 {
-                        let extrapolated = (Double(self.lastBytes) / fraction) / 1_048_576.0
-                        totalMB = String(format: "%.1f", extrapolated)
-                    } else if fraction == 0.0 {
-                         completedMB = "0.0"
-                    }
+                    let msg = self.frame(fraction: fraction)
                     
-                    let barLength = 20
-                    let completedBars = min(barLength, Int(fraction * Double(barLength)))
-                    let emptyBars = max(0, barLength - completedBars)
-                    
-                    var bars = ""
-                    if completedBars > 0 {
-                        bars += String(repeating: "=", count: completedBars - 1) + ">"
-                    }
-                    bars += String(repeating: " ", count: emptyBars)
-                    
-                    let pctStr = String(format: "%3d%%", pct)
-                    let spinner = self.spinnerFrames[self.frameIndex]
-                    let speedText = "| Speed: \(self.speedStr)"
-                    
-                    let msg = String(format: "\r[SwiftLM] Download: [%@] %@ %@ (%@ MB / %@ MB) %@", bars, pctStr, spinner, completedMB, totalMB, speedText)
-                    
+                    if self.isDone { break }
                     print(msg.padding(toLength: 100, withPad: " ", startingAt: 0), terminator: "")
                     fflush(stdout)
-                    
+                    Self.barOpen = true
+
                     if fraction >= 1.0 {
                         print("")
+                        Self.barOpen = false
                         self.isDone = true
                         break
                     }
@@ -187,6 +462,113 @@ final class ProgressTracker {
             }
         }
     }
+}
+
+/// Emit one machine-readable JSON-lines event on stdout for the Aegis-AI
+/// daemon to consume (`docs/AEGIS_INTEGRATION.md`, and the daemon's own
+/// `daemon/spec/engine-protocol.md`). Shared by the `ready` event and the
+/// `exiting` event so the JSON-encode-and-flush boilerplate isn't
+/// duplicated at each call site — this is deliberately the SAME manual
+/// `JSONSerialization` shape the pre-existing `ready` event already used,
+/// not a new encoding convention.
+///
+/// Code-review finding: encoding failure used to be silently swallowed —
+/// for a protocol-critical signal the daemon is meant to positively rely
+/// on (not just infer), a dropped emit with zero diagnostic trail would be
+/// hard to ever notice. Logs to stderr on failure instead.
+/// `preface` lines are written in the same `print` as the JSON, so no generation
+/// token can land between them and push the JSON off the start of its line.
+func emitEvent(_ payload: [String: Any], preface: String? = nil) {
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        FileHandle.standardError.write(
+            Data("[SwiftLM] failed to encode event for stdout: \(payload)\n".utf8))
+        return
+    }
+    var out = ""
+    if ProgressTracker.barOpen {
+        out += "\n"
+        ProgressTracker.barOpen = false
+    }
+    if let preface { out += preface + "\n" }
+    print(out + json)
+    fflush(stdout)
+}
+
+/// Ends the process after a requested shutdown (SIGTERM/SIGINT) without running
+/// C++ static destructors or `atexit` handlers.
+///
+/// `exit()` tears those down while an inference thread may still be inside an MLX
+/// GPU eval, so a shutdown during generation crashed (SIGSEGV in
+/// `CustomKernel::eval_gpu`'s kernel map, or SIGABRT) right after the
+/// `exiting{reason:"requested"}` event: the daemon saw a crash report and a
+/// non-zero status for a clean stop. Nothing needs those destructors at this
+/// point; stdout/stderr are flushed so the exiting event and logs are not lost.
+func exitAfterShutdownRequest() -> Never {
+    fflush(stdout)
+    fflush(stderr)
+    Darwin._exit(0)
+}
+
+/// Where `run()` is when it throws, so `classifyExitReason` can produce a more
+/// precise `reason` than "something failed" and `detail` can name which load
+/// stalled. Set immediately before each fallible stage begins; read only if
+/// that stage (or something after it and before the next `phase =` update)
+/// throws.
+enum LoadPhase: String {
+    case startup
+    case architectureProbe
+    case mainModelLoad
+    case draftModelLoad
+    case mtpAssistantLoad
+    case chatTemplateProbe
+    case portBind
+}
+
+/// Maps a thrown error (plus the `LoadPhase` it happened in) to one of the
+/// daemon's closed snake_case `reason` values (`daemon/spec/engine-protocol.md`
+/// in the Aegis-AI repo). Unrecognized/unclassifiable failures fall back to
+/// `binary_error` rather than inventing a new reason string, since the daemon
+/// treats the set as closed and ignores values it doesn't recognize.
+func classifyExitReason(_ error: Error, phase: LoadPhase) -> String {
+    // Port bind failures surface as NIOCore.IOError wrapping the bind() errno.
+    // EADDRINUSE is the case Aegis-AI's daemon cares about distinguishing (it
+    // means "something else already owns this port", not a SwiftLM defect).
+    if phase == .portBind {
+        if let ioError = error as? IOError, ioError.errnoCode == EADDRINUSE {
+            return "port_conflict"
+        }
+        // Any other error thrown while binding is still a bind-phase failure,
+        // not a model-load one — fall through to the generic classification
+        // below rather than mislabeling it model_load_failed.
+    }
+
+    // A malformed chat_template.jinja is a model artifact defect, not a binary
+    // defect — bucket it (and every other failure raised while a model/probe
+    // was loading) under model_load_failed.
+    if error is MalformedChatTemplate {
+        return "model_load_failed"
+    }
+    switch phase {
+    case .architectureProbe, .mainModelLoad, .draftModelLoad, .mtpAssistantLoad,
+        .chatTemplateProbe:
+        return "model_load_failed"
+    default:
+        break
+    }
+
+    // MLX/Metal allocation failures don't have a dedicated Swift error type in
+    // mlx-swift (uncaught MLX errors call fatalError directly, which is out of
+    // scope here — see AEGIS_INTEGRATION.md). When one does reach us as a
+    // thrown Swift error, it's identifiable only by message text.
+    let message = String(describing: error).lowercased()
+    if message.contains("out of memory") || message.contains("cannot allocate")
+        || message.contains("enomem") || message.contains("bad_alloc") {
+        return "out_of_memory"
+    }
+
+    return "binary_error"
 }
 
 @main
@@ -229,11 +611,26 @@ struct MLXServer: AsyncParsableCommand {
     @Option(name: .long, help: "Number of parallel request slots")
     var parallel: Int = 1
 
+    @Option(name: .long, help: "Reject prompts longer than this many tokens with an OpenAI-style 400 (context_length_exceeded) before prefill. Default: no limit")
+    var maxPromptTokens: Int?
+
+    @Option(name: .long, help: "Prompt cache entries kept in memory (LRU; values below 1 are raised to 1). More entries let interleaved sessions each keep their prefix, at the cost of one KV copy per entry. Under memory pressure the cache keeps only its most recent entry (warning) or is emptied (critical)")
+    var promptCacheEntries: Int = 1
+
     @Flag(name: .long, help: "Enable thinking/reasoning mode (Qwen3.5 etc). Default: disabled")
     var thinking: Bool = false
 
+    @Option(name: .long, help: "Hard cap on reasoning tokens per request (overridable per request with thinking_budget). After N thinking tokens the server closes the thinking block and the model answers. 0 closes it immediately. Needs thinking enabled and --max-tokens (or the request's max_tokens) large enough to hold the budget plus the answer. Default: no cap")
+    var thinkingBudget: Int?
+
+    @Flag(name: .long, help: "Do not echo generated tokens to stdout as they stream. Request log lines are unaffected.")
+    var noTokenEcho: Bool = false
+
     @Flag(name: .long, help: "Enable VLM (vision-language model) mode for image inputs")
     var vision: Bool = false
+
+    @Flag(name: .long, help: "Load a vision-capable checkpoint as a text-only LLM, skipping VLM auto-detection. Text-only workloads then get the prompt cache, which is still skipped for most VLM-loaded models (Gemma 4 text-only requests are cached)")
+    var noVision: Bool = false
 
     @Flag(name: .long, help: "Enable ALM (audio-language model) mode for audio inputs")
     var audio: Bool = false
@@ -286,7 +683,41 @@ struct MLXServer: AsyncParsableCommand {
     @Option(name: .long, help: "Number of MTP tokens to generate per speculation round (default: 3)")
     var numMtpTokens: Int = 3
 
+    @Option(name: .long, help: "Assistant checkpoint providing MTP heads, for model families that ship them separately instead of in the main checkpoint (Gemma 4). Ignored when the main model carries its own MTP heads (Qwen3.5, DeepSeek V4).")
+    var mtpAssistantModel: String?
+
+    func validate() throws {
+        if let thinkingBudget, thinkingBudget < 0 {
+            throw ValidationError("--thinking-budget must be 0 or more.")
+        }
+        if vision && noVision {
+            throw ValidationError("--vision and --no-vision are mutually exclusive.")
+        }
+    }
+
+    /// Entry point. Delegates to `runInner`, then — on any thrown error, at any
+    /// stage — self-reports it as an `exiting` event before rethrowing, so
+    /// process exit status is unchanged but the daemon gets a positive signal
+    /// instead of having to infer failure cause from an empty pipe.
+    /// `reason: "requested"` (the SIGTERM/SIGINT path, below in `runInner`)
+    /// already had its own emit before this task; this handles every other
+    /// exit path — see `docs/AEGIS_INTEGRATION.md` for the full reason list.
     mutating func run() async throws {
+        var phase = LoadPhase.startup
+        do {
+            try await runInner(phase: &phase)
+        } catch {
+            let reason = classifyExitReason(error, phase: phase)
+            emitEvent([
+                "event": "exiting",
+                "reason": reason,
+                "detail": String(describing: error),
+            ])
+            throw error
+        }
+    }
+
+    private mutating func runInner(phase: inout LoadPhase) async throws {
         // Raise the open-file limit: large sharded models (e.g. Kimi K2.5, 182 safetensor
         // shards) + draft model + metallib + dylibs can exhaust the default macOS FD limit of 256.
         var rl = rlimit()
@@ -309,6 +740,18 @@ struct MLXServer: AsyncParsableCommand {
             setenv("SWIFTLM_MTP_ENABLE", "1", 1)
         }
 
+        // SSD expert streaming keeps one persistent pread buffer set per layer, so
+        // concurrent requests overwrite each other's experts and corrupt the heap.
+        if self.streamExperts && self.parallel > 1 {
+            print("[SwiftLM] Warning: --stream-experts supports one request at a time; ignoring --parallel \(self.parallel) and using 1.")
+            self.parallel = 1
+        }
+
+        if self.promptCacheEntries < 1 {
+            print("[SwiftLM] Warning: --prompt-cache-entries must be at least 1, got \(self.promptCacheEntries). Using 1.")
+            self.promptCacheEntries = 1
+        }
+
         // Register SwiftLM-owned DFlash model types before any model loading.
         await registerDFlashModelTypes()
 
@@ -316,17 +759,27 @@ struct MLXServer: AsyncParsableCommand {
         let modelId = model
 
         // ── Load model ──
+        // Same root the loader's HubApi uses further down.
+        let cliHub = HubApi(
+            downloadBase: URL.applicationSupportDirectory
+                .appendingPathComponent("MLX", isDirectory: true)
+                .appendingPathComponent("HuggingFace", isDirectory: true))
+        let isHubId = !ModelStorage.isLocalDirectoryPath(modelId)
+            && !FileManager.default.fileExists(atPath: modelId)
+
         var modelConfig: ModelConfiguration
-        let fileManager = FileManager.default
-        if fileManager.fileExists(atPath: modelId) {
-            var isDir: ObjCBool = false
-            fileManager.fileExists(atPath: modelId, isDirectory: &isDir)
-            if isDir.boolValue {
-                print("[SwiftLM] Loading from local directory: \(modelId)")
-                modelConfig = ModelConfiguration(directory: URL(filePath: modelId))
-            } else {
-                modelConfig = ModelConfiguration(id: modelId)
-            }
+        if ModelStorage.isLocalDirectoryPath(modelId) {
+            print("[SwiftLM] Loading from local directory: \(modelId)")
+            modelConfig = ModelConfiguration(directory: URL(filePath: modelId))
+        } else if let localDirectory = ModelStorage.validatedContentDirectory(for: modelId) {
+            // Any validated copy in the shared HF cache, in any supported layout. Note
+            // this deliberately does NOT use localLoadDirectory: that skips the
+            // materialized `models/<org>/<name>` layout on the grounds that HubApi
+            // resolves it, which is true for the app but not here — the CLI's HubApi
+            // below is rooted at Application Support, so a model the app downloaded is
+            // invisible to it and would be fetched again (#110).
+            print("[SwiftLM] Loading from local cache: \(localDirectory.path)")
+            modelConfig = ModelConfiguration(directory: localDirectory)
         } else {
             modelConfig = ModelConfiguration(id: modelId)
         }
@@ -336,7 +789,29 @@ struct MLXServer: AsyncParsableCommand {
         // planning (line ~474), so it must be declared at this scope.
         // ModelProfiler.profile() does a filesystem walk; only run it when
         // --stream-experts is active to avoid startup overhead on normal launches.
-        let modelDirectory = resolveModelDirectory(modelId: modelId)
+        // ModelStorage first: resolveModelDirectory predates the layout work and knows
+        // only ~/Library/Caches and ~/.cache with a mandatory snapshots/ level, so for a
+        // hand-copied or huggingface-cli model it returns nil — which skipped the MoE
+        // guard *and* the ExpertStreamingConfig activation while still setting lazyLoad,
+        // i.e. lazy weights with no streamer (the #112 memory shape) and no diagnostic.
+        var modelDirectory =
+            ModelStorage.validatedContentDirectory(for: modelId)
+            ?? resolveModelDirectory(modelId: modelId)
+        var modelDirectoryComplete = false
+        // --info doesn't download; don't profile a copy that is clearly partial.
+        if self.streamExperts, self.info, isHubId, let dir = modelDirectory,
+            localWeightState(in: dir) == .incomplete
+        {
+            modelDirectory = nil
+        }
+        if self.streamExperts, !self.info, isHubId {
+            // A Hub or download failure here is a model problem, not a binary one.
+            phase = .architectureProbe
+            let resolved = try await resolveStreamingDirectory(
+                modelId: modelId, candidate: modelDirectory, hub: cliHub)
+            modelDirectory = resolved.directory
+            modelDirectoryComplete = resolved.complete
+        }
         var mainModelProfile: ModelProfile? = nil
         if self.streamExperts, let dir = modelDirectory {
             mainModelProfile = ModelProfiler.profile(modelDirectory: dir, modelId: modelId)
@@ -346,8 +821,19 @@ struct MLXServer: AsyncParsableCommand {
             // and erroneous auto-capping of draft tokens.
             if let profile = mainModelProfile, !profile.isMoE {
                 print("[SwiftLM] ⚠️  Model does not support SSD expert streaming (\(profile.modelType) is not MoE). Ignoring --stream-experts flag.")
+                let countDescription = profile.numExperts.map { "routed-expert count is \($0)" }
+                    ?? "no routed-expert count found in config.json (num_local_experts / num_experts / n_routed_experts)"
+                print("[SwiftLM]    \(countDescription).")
+                print("[SwiftLM]    If this model *is* MoE, please report it — see issue #112.")
                 self.streamExperts = false
             }
+        }
+
+        // Streaming is activated for `modelDirectory`, and only a load of that exact
+        // directory streams. Load from it, or a different lookup could pick another copy.
+        // A complete copy also loads from here after the MoE check turns streaming off.
+        if let dir = modelDirectory, self.streamExperts || modelDirectoryComplete {
+            modelConfig = ModelConfiguration(directory: dir)
         }
 
         // Inject streaming flag into config to bypass eval(model) if requested
@@ -470,9 +956,11 @@ struct MLXServer: AsyncParsableCommand {
         }
         
         var partitionPlan: PartitionPlan?
+        var modelIsMoE = false
         if let modelDir = modelDirectory {
            let profile = mainModelProfile ?? ModelProfiler.profile(modelDirectory: modelDir, modelId: modelId)
            if let profile = profile {
+            modelIsMoE = profile.isMoE
             let system = ModelProfiler.systemProfile()
             let contextSize = self.ctxSize ?? 4096
             let plan = ModelProfiler.plan(model: profile, system: system, contextSize: contextSize, draftWeightBytes: draftFootprintBytes)
@@ -487,12 +975,9 @@ struct MLXServer: AsyncParsableCommand {
             // Apply memory strategy
             switch plan.strategy {
             case .fullGPU:
-                print("[SwiftLM] \(plan.strategy.emoji) Memory strategy: FULL GPU (\(String(format: "%.1f", plan.weightMemoryGB))GB model, \(String(format: "%.1f", system.availableRAMGB))GB available)")
-                // Backstop: cap MLX's memory ceiling at 80% of physical RAM.
-                // The full-GPU strategy otherwise leaves the MLX default ceiling
-                // (about physical RAM) untouched, so a runaway buffer cache could
-                // consume the whole machine. The allocator size-bucketing keeps the
-                // cache near the working set in practice; this is the hard safety net.
+                Memory.cacheLimit = plan.recommendedCacheLimit
+                print("[SwiftLM] \(plan.strategy.emoji) Memory strategy: FULL GPU (\(String(format: "%.1f", plan.weightMemoryGB))GB model, \(String(format: "%.1f", system.availableRAMGB))GB available, cache limited to \(plan.recommendedCacheLimit / (1024*1024))MB)")
+                // Limit MLX allocations to 80% of physical RAM.
                 let memoryBackstopBytes = Int(Double(system.totalRAMBytes) * 0.8)
                 Memory.memoryLimit = memoryBackstopBytes
                 print("[SwiftLM]    memory ceiling capped at \(memoryBackstopBytes / (1024*1024*1024))GB (80% of physical RAM)")
@@ -564,11 +1049,43 @@ struct MLXServer: AsyncParsableCommand {
             .appendingPathComponent("HuggingFace", isDirectory: true)
         let hub = HubApi(downloadBase: cacheRoot)
         let downloader = HubDownloader(hub: hub)
+        phase = .architectureProbe
         let architecture = try await ModelArchitectureProbe.inspect(
             configuration: modelConfig,
             downloader: downloader
         )
-        let isVision = self.vision
+        // architecture is probed above for both paths; the CLI previously discarded it
+        // here (`let isVision = self.vision`), so a known VLM checkpoint loaded as a
+        // plain LLM unless the user remembered `--vision` — confirmed by running
+        // LiquidAI/LFM2.5-VL-450M-MLX-4bit without the flag: "Loading LLM" and the
+        // subsequent image request failed. InferenceEngine.swift (SwiftBuddy's loader)
+        // already auto-detects unconditionally; this mirrors that for the CLI binary
+        // while keeping --vision/--audio as explicit overrides.
+        // Speculative/MTP decoding (--draft-model, --dflash, --mtp) only wires up
+        // BaseLanguageModel from LLMModelFactory — a VLMModelFactory container isn't
+        // a DualModelMTP/generateMTP participant. Auto-detection must not flip a
+        // speculative-decoding session into VLM mode just because the checkpoint
+        // carries a vision_config (e.g. mlx-community/Qwen3.5-*-4bit ships one even
+        // when used purely as a text draft/main pair): doing so crashed the server
+        // with a Trace/BPT trap on the first real generation request, caught by CI's
+        // speculative-decoding suite. --vision remains a valid explicit override.
+        let speculativeDecodingRequested = self.draftModel != nil || self.dflash || self.mtp
+        let autoDetectedVision = !self.audio && architecture.supportsVision
+            && !speculativeDecodingRequested && !self.noVision
+        var isVision = self.vision || autoDetectedVision
+        if architecture.supportsVision, !self.vision, !self.audio, speculativeDecodingRequested {
+            print(
+                "[SwiftLM] Note: \(architecture.modelType ?? "unknown") reports vision support, but speculative/MTP decoding was requested; loading as a text-only LLM."
+            )
+        } else if architecture.supportsVision, !self.audio, self.noVision {
+            print(
+                "[SwiftLM] Note: \(architecture.modelType ?? "unknown") reports vision support, but --no-vision was given; loading as a text-only LLM."
+            )
+        } else if autoDetectedVision {
+            print(
+                "[SwiftLM] Auto-detected VLM config (\(architecture.modelType ?? "unknown")); enabling vision mode."
+            )
+        }
         let container: ModelContainer
         
         // Handle getting the simple model ID string for the tracker
@@ -577,25 +1094,44 @@ struct MLXServer: AsyncParsableCommand {
             return self.model
         }()
         let tracker = ProgressTracker(modelId: resolvedModelId)
+        defer { tracker.finish() }
         
         let isAudio = self.audio
+        phase = .mainModelLoad
         if isVision && isAudio {
             print("[SwiftLM] Loading Omni-Language Model (Text + Vision + Audio)...")
             container = try await OmniModelFactory.shared.loadContainer(
                 from: downloader,
-                using: TransformersTokenizerLoader(),
+                using: TransformersTokenizerLoader(modelId: resolvedModelId),
                 configuration: modelConfig
             ) { progress in
                 tracker.printProgress(progress)
             }
         } else if isVision {
             print("[SwiftLM] Loading VLM (vision-language model)...")
-            container = try await VLMModelFactory.shared.loadContainer(
-                from: downloader,
-                using: TransformersTokenizerLoader(),
-                configuration: modelConfig
-            ) { progress in
-                tracker.printProgress(progress)
+            do {
+                container = try await VLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: TransformersTokenizerLoader(modelId: resolvedModelId),
+                    configuration: modelConfig
+                ) { progress in
+                    tracker.printProgress(progress)
+                }
+            } catch where !self.vision && isVLMCheckpointMismatch(error) {
+                // Vision was only auto-detected, and the vision side of the checkpoint
+                // doesn't match the VLM code (e.g. a preprocessor_config.json without
+                // image_mean). The text model can still serve, so fall back rather than
+                // exit. Cancellation, network and I/O errors still propagate, as does
+                // any error under an explicit --vision.
+                print("[SwiftLM] ⚠️  Auto-detected VLM failed to load (\(error)); loading as a text-only LLM. Pass --vision to make this fatal.")
+                isVision = false
+                container = try await LLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: TransformersTokenizerLoader(modelId: resolvedModelId),
+                    configuration: modelConfig
+                ) { progress in
+                    tracker.printProgress(progress)
+                }
             }
         } else if isAudio {
             print("[SwiftLM] Loading ALM (audio-language model)...")
@@ -603,7 +1139,7 @@ struct MLXServer: AsyncParsableCommand {
             // and the native prepareForMultimodal path extracts real mel features.
             container = try await OmniModelFactory.shared.loadContainer(
                 from: downloader,
-                using: TransformersTokenizerLoader(),
+                using: TransformersTokenizerLoader(modelId: resolvedModelId),
                 configuration: modelConfig
             ) { progress in
                 tracker.printProgress(progress)
@@ -612,13 +1148,20 @@ struct MLXServer: AsyncParsableCommand {
             print("[SwiftLM] Loading LLM (large language model)...")
             container = try await LLMModelFactory.shared.loadContainer(
                 from: downloader,
-                using: TransformersTokenizerLoader(),
+                using: TransformersTokenizerLoader(modelId: resolvedModelId),
                 configuration: modelConfig
             ) { progress in
                 tracker.printProgress(progress)
             }
         }
 
+        // Final after the VLM→LLM fallback above; later closures capture this `let`.
+        let loadedAsVision = isVision
+        if loadedAsVision || isAudio {
+            print("[SwiftLM] Note: the prompt cache is only used for text requests on Gemma 4 VLM/Omni loads; other VLM/Omni models re-prefill each text prompt in full.")
+        }
+
+        tracker.finish()
         print("[SwiftLM] Loaded model configuration. Inferred tool call format: \(String(describing: await container.configuration.toolCallFormat))")
 
         // ── Check if target model supports DFlash ──
@@ -657,9 +1200,10 @@ struct MLXServer: AsyncParsableCommand {
                 draftConfig.lazyLoad = true
             }
             let draftDownloader = HubDownloader(hub: HubApi(downloadBase: cacheRoot))
+            phase = .draftModelLoad
             let draftContainer = try await LLMModelFactory.shared.loadContainer(
                 from: draftDownloader,
-                using: TransformersTokenizerLoader(),
+                using: TransformersTokenizerLoader(modelId: resolvedModelId),
                 configuration: draftConfig
             ) { progress in
                 // Silent loading for draft model
@@ -670,6 +1214,50 @@ struct MLXServer: AsyncParsableCommand {
         } else {
             draftModelRef = nil
         }
+
+        // ── Load the MTP assistant, for families that ship MTP heads separately ──
+        // Qwen3.5 and DeepSeek V4 carry their MTP heads inside the main checkpoint and
+        // conform to MTPLanguageModel directly, so generateMTP already works for them.
+        // Gemma 4 does not: Google ships the heads as a separate assistant checkpoint,
+        // and Gemma4AssistantModel conforms to DualModelMTP — MTPLanguageModel plus a
+        // back-reference to the trunk it drafts for. Loading it here and injecting that
+        // reference is what makes --mtp mean anything for Gemma 4; without it the flag
+        // is silently a no-op, because the main model fails the MTPLanguageModel test.
+        var mtpAssistantModelRef: (any DualModelMTP)? = nil
+        if self.mtp, let assistantPath = self.mtpAssistantModel {
+            print("[SwiftLM] Loading MTP assistant: \(assistantPath)")
+            var assistantConfig: ModelConfiguration
+            if FileManager.default.fileExists(atPath: assistantPath) {
+                assistantConfig = ModelConfiguration(directory: URL(filePath: assistantPath))
+            } else if let local = ModelStorage.validatedContentDirectory(for: assistantPath) {
+                assistantConfig = ModelConfiguration(directory: local)
+            } else {
+                assistantConfig = ModelConfiguration(id: assistantPath)
+            }
+            if self.streamExperts { assistantConfig.lazyLoad = true }
+            let assistantDownloader = HubDownloader(hub: HubApi(downloadBase: cacheRoot))
+            phase = .mtpAssistantLoad
+            let assistantContainer = try await LLMModelFactory.shared.loadContainer(
+                from: assistantDownloader,
+                using: TransformersTokenizerLoader(modelId: resolvedModelId),
+                configuration: assistantConfig
+            ) { _ in }
+            mtpAssistantModelRef = await assistantContainer.perform { assistantContext in
+                assistantContext.model as? (any DualModelMTP)
+            }
+            if mtpAssistantModelRef == nil {
+                print("[SwiftLM] ⚠️  \(assistantPath) does not provide MTP heads (not a DualModelMTP).")
+                print("[SwiftLM]    Ignoring --mtp-assistant-model; generation will not use MTP.")
+            } else {
+                // The assistant drafts *for* this trunk, so it needs a reference to it.
+                let assistant = mtpAssistantModelRef
+                await container.perform { mainContext in
+                    assistant?.mainModelRef = mainContext.model
+                }
+                print("[SwiftLM] MTP assistant ready (\(self.numMtpTokens) tokens/round)")
+            }
+        }
+        let loadedMTPAssistant = mtpAssistantModelRef
 
         // ── Load DFlash draft model for block-diffusion speculative decoding ──
         let dflashModel: DFlashDraftModel?
@@ -739,6 +1327,12 @@ struct MLXServer: AsyncParsableCommand {
                 let total = partitionPlan?.totalLayers ?? actual
                 let cpuCount = total - actual
                 print("[SwiftLM] 🔀 Layer split active: \(actual) GPU / \(cpuCount) CPU")
+                if modelIsMoE && cpuCount > 0 {
+                    // CPU-resident MoE layers run the quantized expert matmuls on a
+                    // single core (~0.4 tok/s prefill on Gemma 4 26B-A4B, see #176).
+                    print("[SwiftLM] ⚠️  \(cpuCount) MoE layers will run on the CPU, which is very slow (expect well under 1 tok/s).")
+                    print("[SwiftLM]    For MoE models that don't fit in GPU memory, prefer --stream-experts over --gpu-layers.")
+                }
                 // Update the partition plan to reflect actual split
                 partitionPlan?.gpuLayers = actual
             } else {
@@ -781,6 +1375,73 @@ struct MLXServer: AsyncParsableCommand {
             print("[SwiftLM] 🧠 Auto-calibration (Wisdom) bypassed for SSD Streaming")
         }
 
+        // Render the chat template once before opening the port. A checkpoint whose
+        // template does not parse otherwise loads cleanly, reports ready, and then fails
+        // every single request — a shape that reads as a broken server rather than a
+        // broken model, and that survives restarts without ever explaining itself.
+        // Failing here instead costs one template render and makes the cause the first
+        // thing anybody sees.
+        //
+        // A model with no chat template at all is a different and legitimate case (base
+        // models ship without one, and /v1/completions does not need it), so that is
+        // passed over rather than treated as a defect.
+        phase = .chatTemplateProbe
+        do {
+            let probeTokenizer = await container.tokenizer
+            // Shaped like the simplest real request rather than a bare minimum: one user
+            // turn with a generation prompt is what every chat template is written to
+            // handle, so a failure here is the template's, not the probe's.
+            _ = try probeTokenizer.applyChatTemplate(
+                messages: [["role": "user", "content": "ping"]],
+                tools: nil,
+                additionalContext: ["add_generation_prompt": true]
+            )
+        } catch let error as MalformedChatTemplate {
+            print("[SwiftLM] ❌ \(error.description)")
+            throw error
+        } catch {
+            // Missing template, or a template that needs context this probe does not
+            // supply. Neither is a reason to refuse to start.
+        }
+
+        // Issue #168: render once more with a minimal non-empty tools array. The probe
+        // above uses `tools: nil`, so a checkpoint whose template (or tool payload)
+        // breaks only under the tools branch loaded clean and then failed every real
+        // agentic request. Warn rather than abort: a tools-broken model still serves
+        // plain chat and /v1/completions.
+        do {
+            let probeTokenizer = await container.tokenizer
+            let probeTool: [String: any Sendable] = [
+                "type": "function",
+                "function": [
+                    "name": "probe",
+                    "description": "startup chat-template tools probe",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "query": ["type": "string", "default": NSNull() as any Sendable]
+                        ],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+            _ = try probeTokenizer.applyChatTemplate(
+                messages: [["role": "user", "content": "ping"]],
+                tools: [probeTool],
+                additionalContext: ["add_generation_prompt": true]
+            )
+        } catch let error as MalformedChatTemplate {
+            print("[SwiftLM] ⚠️  chat-template tools probe failed (plain chat may still work): \(error.description)")
+        } catch {
+            // Same lenient pass as above: no template, or context the probe lacks.
+        }
+
+        // mlx-swift-lm's concurrent loader materializes every tensor in the
+        // checkpoint before `sanitize` runs, so tensors the model drops (e.g. a
+        // vision tower when loading text-only) are freed into MLX's buffer cache.
+        // With --stream-experts the cache limit is the SSD budget, so those
+        // buffers would otherwise stay resident for the life of the server.
+        Memory.clearCache()
+
         print("[SwiftLM] Model loaded. Starting HTTP server on \(host):\(port)")
 
         // ── Capture CLI defaults into a shared config ──
@@ -794,11 +1455,16 @@ struct MLXServer: AsyncParsableCommand {
             minP: self.minP,
             repeatPenalty: self.repeatPenalty,
             thinking: self.thinking,
-            isVision: isVision,
+            thinkingBudget: self.thinkingBudget,
+            maxPromptTokens: self.maxPromptTokens,
+            promptCacheEntries: self.promptCacheEntries,
+            tokenEcho: !self.noTokenEcho,
+            isVision: loadedAsVision,
             prefillSize: self.prefillSize,
             turboKV: self.turboKV,
             mtp: self.mtp,
-            numMtpTokens: self.numMtpTokens
+            numMtpTokens: self.numMtpTokens,
+            mtpAssistantModel: self.mtpAssistantModel
         )
 
         let parallelSlots = self.parallel
@@ -830,7 +1496,10 @@ struct MLXServer: AsyncParsableCommand {
         let ssdStr = self.streamExperts ? "enabled" : "disabled"
         let turboKVStr = config.turboKV ? "enabled" : "disabled"
         let mtpStr = config.mtp ? "enabled (\(config.numMtpTokens) tokens/round)" : "disabled"
-        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr)")
+        print("[SwiftLM] Config: ctx_size=\(ctxSizeStr), temp=\(config.temp), top_p=\(config.topP), top_k=\(topKStr), min_p=\(minPStr), repeat_penalty=\(penaltyStr), parallel=\(parallelSlots), cors=\(corsStr), mem_limit=\(memLimitStr), auth=\(authStr), thinking=\(thinkingStr), ssd_stream=\(ssdStr), turbo_kv=\(turboKVStr), mtp=\(mtpStr), prompt_cache_entries=\(config.promptCacheEntries)")
+        if config.turboKV, let ctx = config.ctxSize {
+            print("[SwiftLM] ⚠️  --turbo-kv has no effect with --ctx-size \(ctx): a bounded context gives the attention layers a RotatingKVCache, and TurboKV only compresses KVCacheSimple. Drop --ctx-size to use --turbo-kv.")
+        }
 
         // ── Build Hummingbird router ──
         let router = Router()
@@ -878,7 +1547,7 @@ struct MLXServer: AsyncParsableCommand {
                 }
             }
             let payload = """
-{"status":"ok","model":"\(modelId)","vision":\(isVision),"memory":{"active_mb":\(activeMemMB),"peak_mb":\(peakMemMB),"cache_mb":\(cacheMemMB),"total_system_mb":\(totalMemMB),"gpu_architecture":"\(deviceInfo.architecture)"},"stats":{"requests_total":\(snapshot.requestsTotal),"requests_active":\(snapshot.requestsActive),"tokens_generated":\(snapshot.tokensGenerated),"avg_tokens_per_sec":\(String(format: "%.2f", snapshot.avgTokensPerSec))}\(partitionJson)}
+{"status":"ok","model":"\(modelId)","vision":\(loadedAsVision),"memory":{"active_mb":\(activeMemMB),"peak_mb":\(peakMemMB),"cache_mb":\(cacheMemMB),"total_system_mb":\(totalMemMB),"gpu_architecture":"\(deviceInfo.architecture)"},"stats":{"requests_total":\(snapshot.requestsTotal),"requests_active":\(snapshot.requestsActive),"tokens_generated":\(snapshot.tokensGenerated),"avg_tokens_per_sec":\(String(format: "%.2f", snapshot.avgTokensPerSec))}\(partitionJson)}
 """
             return Response(
                 status: .ok,
@@ -900,7 +1569,28 @@ struct MLXServer: AsyncParsableCommand {
         }
 
         // Chat completions — handler extracted to avoid type-checker timeout
-        let promptCache = PromptCache()
+        let promptCache = PromptCache(maxEntries: config.promptCacheEntries)
+        // Cached KV is the largest evictable allocation; give it back before the OS has to
+        // compress or kill. A warning drops every entry but the most recent one (the live
+        // conversation), so with the default --prompt-cache-entries 1 it drops nothing; a
+        // critical event drops all of them, including that last one. Keep the source for
+        // the server's lifetime.
+        let memoryPressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical])
+        memoryPressure.setEventHandler {
+            let critical = memoryPressure.data.contains(.critical)
+            Task {
+                let dropped = await promptCache.evict(keepMostRecent: !critical)
+                guard dropped > 0 else { return }
+                // The evicted KV buffers go back to MLX's allocator cache, not to the OS, so
+                // without this the eviction frees almost no memory. Safe while a request is
+                // generating: it only releases buffers the allocator holds unused. It takes
+                // MLX's global eval lock and so may wait for an in-flight eval, which is why
+                // it runs here and not on the GCD handler thread.
+                Memory.clearCache()
+                print("[SwiftLM] Memory pressure (\(critical ? "critical" : "warning")): evicted \(dropped) prompt cache \(dropped == 1 ? "entry" : "entries")")
+            }
+        }
+        memoryPressure.resume()
         router.post("/v1/chat/completions") { request, _ -> Response in
             do {
                 let bodyData = try await collectBody(request)
@@ -908,17 +1598,14 @@ struct MLXServer: AsyncParsableCommand {
                     request: request, bodyData: bodyData, config: config, container: container, semaphore: semaphore, stats: stats, promptCache: promptCache,
                     draftModelRef: draftModelRef, numDraftTokens: numDraftTokensConfig,
                     dflashModel: dflashModel, dflashBlockSize: dflashBlockSizeConfig,
-                    dflashTargetModel: dflashTargetModel
+                    dflashTargetModel: dflashTargetModel,
+                    mtpAssistant: loadedMTPAssistant
                 )
             } catch {
-                let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
-                let payload = """
-                {"error":{"message":"\(errMsg)","type":"server_error","code":"internal_error"}}
-                """
                 return Response(
                     status: .internalServerError,
                     headers: jsonHeaders(),
-                    body: .init(byteBuffer: ByteBuffer(string: payload))
+                    body: .init(byteBuffer: ByteBuffer(string: errorJSON(error)))
                 )
             }
         }
@@ -931,14 +1618,10 @@ struct MLXServer: AsyncParsableCommand {
                     request: request, bodyData: bodyData, config: config, container: container, semaphore: semaphore, stats: stats
                 )
             } catch {
-                let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
-                let payload = """
-                {"error":{"message":"\(errMsg)","type":"server_error","code":"internal_error"}}
-                """
                 return Response(
                     status: .internalServerError,
                     headers: jsonHeaders(),
-                    body: .init(byteBuffer: ByteBuffer(string: payload))
+                    body: .init(byteBuffer: ByteBuffer(string: errorJSON(error)))
                 )
             }
         }
@@ -1016,7 +1699,7 @@ struct MLXServer: AsyncParsableCommand {
             "port": port,
             "model": modelId,
             "engine": "mlx",
-            "vision": isVision
+            "vision": loadedAsVision
         ]
         if let plan = partitionPlan {
             var info = plan.healthInfo
@@ -1034,29 +1717,46 @@ struct MLXServer: AsyncParsableCommand {
             }
             readyEvent["partition"] = info
         }
-        if let data = try? JSONSerialization.data(withJSONObject: readyEvent),
-           let json = String(data: data, encoding: .utf8) {
-            print(json)
-            fflush(stdout)
-        }
+        emitEvent(readyEvent)
 
         // ── Graceful shutdown on SIGTERM/SIGINT ──
+        // Engine Protocol v1 (`daemon/spec/engine-protocol.md` §3, TD-7):
+        // emit `exiting{reason:"requested"}` before exiting so the daemon
+        // can tell a planned, no-error stop apart from a real failure —
+        // `requested` has no `ExitClassification` equivalent on the daemon
+        // side (a daemon-requested stop never reaches that classifier at
+        // all), it exists purely for the daemon to positively confirm this
+        // was a clean shutdown, not infer it from absence of other signals.
         let shutdownSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
+        // Code-review finding: if the daemon's read end of our stdout pipe
+        // is already gone by the time a shutdown signal arrives (e.g. the
+        // daemon itself already crashed), the exiting-event print()/fflush
+        // below can raise SIGPIPE — whose default disposition kills this
+        // process via signal instead of reaching exitAfterShutdownRequest(), producing
+        // exactly the ambiguous "was this a crash?" signature this feature
+        // exists to eliminate. Ignore SIGPIPE so a closed pipe surfaces as
+        // an ordinary EPIPE write error instead.
+        signal(SIGPIPE, SIG_IGN)
 
         shutdownSource.setEventHandler {
-            print("\n[SwiftLM] Received SIGTERM, shutting down gracefully...")
-            Darwin.exit(0)
+            emitEvent(
+                ["event": "exiting", "reason": "requested"],
+                preface: "\n[SwiftLM] Received SIGTERM, shutting down gracefully...")
+            exitAfterShutdownRequest()
         }
         interruptSource.setEventHandler {
-            print("\n[SwiftLM] Received SIGINT, shutting down gracefully...")
-            Darwin.exit(0)
+            emitEvent(
+                ["event": "exiting", "reason": "requested"],
+                preface: "\n[SwiftLM] Received SIGINT, shutting down gracefully...")
+            exitAfterShutdownRequest()
         }
         shutdownSource.resume()
         interruptSource.resume()
 
+        phase = .portBind
         try await app.runService()
     }
 }
@@ -1073,12 +1773,21 @@ struct ServerConfig: Sendable {
     let minP: Float?
     let repeatPenalty: Float?
     let thinking: Bool
+    /// `--thinking-budget`: default cap on reasoning tokens. nil = no cap.
+    let thinkingBudget: Int?
+    /// `--max-prompt-tokens`: longer prompts are rejected before prefill. nil = no limit.
+    let maxPromptTokens: Int?
+    /// `--prompt-cache-entries`: LRU capacity of the prompt cache.
+    let promptCacheEntries: Int
+    /// Echo each generated chunk to stdout (`--no-token-echo` turns it off).
+    let tokenEcho: Bool
     let isVision: Bool
     let prefillSize: Int
     /// When true, each KVCacheSimple layer compresses history > 8192 tokens to 3-bit PolarQuant.
     let turboKV: Bool
     let mtp: Bool
     let numMtpTokens: Int
+    let mtpAssistantModel: String?
 }
 
 // ── SSD Memory Budget ────────────────────────────────────────────────────────
@@ -1108,8 +1817,7 @@ func resolveModelDirectory(modelId: String) -> URL? {
     let fm = FileManager.default
 
     // Direct local path
-    var isDir: ObjCBool = false
-    if fm.fileExists(atPath: modelId, isDirectory: &isDir), isDir.boolValue {
+    if ModelStorage.isLocalDirectoryPath(modelId) {
         let url = URL(filePath: modelId)
         // Verify config.json exists
         if fm.fileExists(atPath: url.appendingPathComponent("config.json").path) {
@@ -1195,26 +1903,133 @@ actor ServerStats {
 
 
 
+/// Recurrent (MambaCache) layer state captured after `position` prompt tokens, keyed by
+/// layer index. Recurrent state cannot be rewound, so a hybrid prompt that diverges from a
+/// cached one resumes from the last checkpoint before the divergence instead of from zero.
+struct RecurrentCheckpoint {
+    let position: Int
+    let layers: [Int: [MLXArray]]
+}
+
 actor PromptCache {
     struct CachedState {
         let tokens: [Int]            // Full token sequence that generated this KV state
         let states: [[MLXArray]]     // Per-layer KV state arrays
         let metaStates: [[String]]   // Per-layer metadata
+        /// Hybrid entries only: earlier recurrent states, ascending by position, each
+        /// strictly before `tokens.count` (the entry's own state covers that one).
+        var checkpoints: [RecurrentCheckpoint] = []
     }
 
-    private var cached: CachedState?
+    /// Most checkpoints kept per entry; each holds one small recurrent state per layer.
+    static let maxCheckpoints = 4
+
+    /// Most recently used first. Holds at most `maxEntries`.
+    private var entries: [CachedState] = []
+    private let maxEntries: Int
     private var hits: Int = 0
     private var misses: Int = 0
+
+    init(maxEntries: Int = 1) { self.maxEntries = max(1, maxEntries) }
+
+    /// How many trailing tokens of a saved prompt a newer prompt may drop or rewrite and
+    /// still replace it (see `isSuperseded`).
+    ///
+    /// The generic save runs after the first decode token, so the prompt it saves ends with
+    /// the generation prompt (`<|im_start|>assistant\n<think>\n`). Templates that re-render
+    /// history (Qwen3 reasoning templates drop or rewrite it) and edits or regenerations of
+    /// the last message make the next turn diverge from the previous prompt only in its
+    /// last few tokens, so the old prompt is no longer an exact prefix even though it is
+    /// the same conversation. 16 covers those generation prompts with room to spare.
+    ///
+    /// For a cache that can be rewound to any shorter prefix, replacing is bounded: the new
+    /// entry holds the KV for the shared prefix, so any prompt that could have reused the
+    /// old entry loses at most this many tokens of reuse, and the slot goes to something
+    /// else instead of a near-duplicate. A state that cannot be rewound that way (recurrent
+    /// layers, a sliding window that has already dropped tokens) has no such bound and is
+    /// only replaced by an exact extension; `save` picks the rule.
+    static let supersedeSlack = 16
+
+    /// Length of the shared prefix of two token sequences.
+    private static func commonPrefixLength(_ a: [Int], _ b: [Int]) -> Int {
+        var n = 0
+        for (x, y) in zip(a, b) {
+            guard x == y else { break }
+            n += 1
+        }
+        return n
+    }
+
+    /// Whether saving `new` makes the saved `old` redundant.
+    ///
+    /// An exact prefix always does. With `exactPrefixOnly` false (a cache that can be rewound
+    /// to any shorter prefix) so does a near-prefix: `old` diverges from `new` in at most
+    /// `supersedeSlack` trailing tokens, and what it shares with `new` outweighs what it does
+    /// not. The second condition keeps entries that merely start alike apart: a zero-match
+    /// entry is never removable, and a short one (a shared BOS or chat-template header) is
+    /// not replaced by an unrelated prompt just because the whole entry is shorter than the
+    /// slack. Two conversations that share only a system prompt both stay as long as each
+    /// carries more than `supersedeSlack` tokens of its own.
+    ///
+    /// `exactPrefixOnly` is set when the new state cannot stand in for the old one on a
+    /// partial match (see `canRewindToAnyPrefix`): recurrent (hybrid) snapshots are valid
+    /// only at exactly `tokens.count` and consumed by `restoreExactPrefix`, and a wrapped
+    /// ring buffer is rejected by `usableMatch` for any rewind past one token, so for them a
+    /// near-prefix replacement would lose the whole hit, not a few tokens.
+    static func isSuperseded(_ old: [Int], by new: [Int], exactPrefixOnly: Bool) -> Bool {
+        if new.starts(with: old) { return true }
+        if exactPrefixOnly { return false }
+        let shared = commonPrefixLength(old, new)
+        let stale = old.count - shared
+        return stale <= supersedeSlack && shared > stale
+    }
+
+    /// Whether a sliding-window ring buffer has already dropped tokens (offset beyond its
+    /// window). Such a ring can only be rewound by the one slot a full-match replay
+    /// overwrites; anything deeper would leave the window pointing at evicted keys.
+    private static func ringHasDroppedTokens(metaState meta: [String]) -> Bool {
+        // RotatingKVCache.metaState: keep, maxSize, step, offset, idx, ...
+        guard meta.count > 3, let maxSize = Int(meta[1]), let offset = Int(meta[3]) else {
+            return false
+        }
+        return offset > maxSize
+    }
+
+    /// Whether a state saved from `cache` can be restored at any shorter prefix, so that it
+    /// can stand in for a near-prefix entry it replaces: no recurrent layer, and no ring
+    /// buffer that has dropped tokens. This is the same condition `usableMatch` applies when
+    /// restoring.
+    private static func canRewindToAnyPrefix(cache: [KVCache], metaStates: [[String]]) -> Bool {
+        for (layer, meta) in zip(cache, metaStates) {
+            if layer is MambaCache { return false }
+            if layer is RotatingKVCache, ringHasDroppedTokens(metaState: meta) { return false }
+        }
+        return true
+    }
 
     /// Save the full prompt token sequence and its KV state.
     /// IMPORTANT: We must eval() the state arrays immediately. The state getter may
     /// produce lazy computation graphs (e.g. TurboKV decode → reshape → concatenate).
     /// If not materialized now, those lazy references point to the live cache tensors
     /// which get overwritten by subsequent requests, causing stale data / SIGTRAP on restore.
-    func save(tokens: [Int], cache: [KVCache]) {
-        if cache.contains(where: { $0 is MambaCache }) {
+    ///
+    /// Recurrent (MambaCache) layers are refused unless `allowRecurrent` is set: their
+    /// state is only valid if captured at exactly `tokens.count`, which the generic
+    /// post-first-token save cannot guarantee. Only the hybrid path (which snapshots at
+    /// a known boundary) passes true.
+    ///
+    /// `checkpoints` are the recurrent states captured while prefilling this prompt;
+    /// `resumedFrom` is how many tokens a restore supplied, so the entry that supplied them
+    /// passes its own checkpoints (and, for an exact hit, its end state) on to this one.
+    func save(
+        tokens: [Int], cache: [KVCache], allowRecurrent: Bool = false,
+        checkpoints: [RecurrentCheckpoint] = [], resumedFrom: Int = 0
+    ) {
+        if !allowRecurrent, cache.contains(where: { $0 is MambaCache }) {
             return
         }
+        // Nothing can restore an empty prompt, and it would only take a slot.
+        guard !tokens.isEmpty else { return }
         let P = tokens.count
         // For attention KVCacheSimple layers, the state tensor is [B, H, T, D] with a
         // pre-allocated T that can exceed the actual prompt length P. If we store the
@@ -1228,10 +2043,12 @@ actor PromptCache {
                     guard arr.ndim >= 3 else { return arr }
                     let T = arr.dim(2)
                     if T > P { return arr[.ellipsis, ..<P, 0...] }
-                    return arr
+                    return detachedArray(arr)
                 }
             }
-            return s
+            // RotatingKVCache hands out its live ring buffers, which later decode steps
+            // overwrite in place; snapshot them.
+            return s.map(detachedArray)
         }
         let metaStates = cache.map { $0.metaState }
         // Materialize all lazy MLX arrays so they survive cache mutations
@@ -1239,10 +2056,81 @@ actor PromptCache {
         if !allArrays.isEmpty {
             eval(allArrays)
         }
-        cached = CachedState(tokens: tokens, states: states, metaStates: metaStates)
+        // An entry the new one dominates goes: a conversation replaces its own previous turn
+        // instead of filling the cache. Entries are homogeneous within a run (the generic
+        // path refuses recurrent layers), so the new state's kind also describes the entries
+        // being compared. The near-prefix rule needs a state that restores at any prefix.
+        let exactPrefixOnly = allowRecurrent
+            || !Self.canRewindToAnyPrefix(cache: cache, metaStates: metaStates)
+        // Read the resumed-from entry before the removal below drops it.
+        let carried = allowRecurrent
+            ? inheritedCheckpoints(tokens: tokens, resumedFrom: resumedFrom, cache: cache) : []
+        let merged = Self.mergedCheckpoints(carried + checkpoints, before: P)
+        entries.removeAll {
+            Self.isSuperseded($0.tokens, by: tokens, exactPrefixOnly: exactPrefixOnly)
+        }
+        entries.insert(
+            CachedState(tokens: tokens, states: states, metaStates: metaStates, checkpoints: merged),
+            at: 0)
+        if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
     }
 
-    /// Find the longest common prefix between `newTokens` and the cached sequence.
+    /// Checkpoints of the entry a restore resumed from, up to `resumedFrom`, plus that
+    /// entry's end state when the restore took all of it. Both are valid for `tokens`
+    /// because they lie inside the prefix it shares with the entry.
+    private func inheritedCheckpoints(
+        tokens: [Int], resumedFrom: Int, cache: [KVCache]
+    ) -> [RecurrentCheckpoint] {
+        guard resumedFrom > 0,
+              let source = entries.first(where: {
+                  Self.commonPrefixLength($0.tokens, tokens) >= resumedFrom
+                      && $0.states.count == cache.count
+              })
+        else { return [] }
+        var inherited = source.checkpoints.filter { $0.position <= resumedFrom }
+        if source.tokens.count == resumedFrom {
+            var layers: [Int: [MLXArray]] = [:]
+            for (i, layer) in cache.enumerated() where layer is MambaCache {
+                layers[i] = source.states[i]
+            }
+            inherited.append(RecurrentCheckpoint(position: resumedFrom, layers: layers))
+        }
+        return inherited
+    }
+
+    /// Ascending, deduplicated checkpoints strictly before `end`, thinned to
+    /// `maxCheckpoints`. The first (the anchor after the system prompt) and the newest are
+    /// kept; otherwise the checkpoint closest to a neighbour goes, so the spread stays even.
+    static func mergedCheckpoints(_ all: [RecurrentCheckpoint], before end: Int) -> [RecurrentCheckpoint] {
+        var out: [RecurrentCheckpoint] = []
+        for cp in all.sorted(by: { $0.position < $1.position })
+        where cp.position > 0 && cp.position < end && cp.position != out.last?.position {
+            out.append(cp)
+        }
+        while out.count > maxCheckpoints {
+            let drop = (1..<out.count - 1).min {
+                Self.gap(out, $0) < Self.gap(out, $1)
+            } ?? 1
+            out.remove(at: drop)
+        }
+        return out
+    }
+
+    private static func gap(_ cps: [RecurrentCheckpoint], _ i: Int) -> Int {
+        min(cps[i].position - cps[i - 1].position, cps[i + 1].position - cps[i].position)
+    }
+
+    /// Drop cached entries under memory pressure: all of them, or all but the most recent.
+    /// Returns how many entries were dropped.
+    @discardableResult
+    func evict(keepMostRecent: Bool) -> Int {
+        let keep = keepMostRecent ? 1 : 0
+        let dropped = max(0, entries.count - keep)
+        if dropped > 0 { entries.removeLast(dropped) }
+        return dropped
+    }
+
+    /// Find the cached entry with the longest usable common prefix with `newTokens`.
     /// Restores matched KV state, trims any excess — mirrors llama-server behaviour.
     /// Returns the number of matched tokens, or nil on a complete miss.
     func restore(newTokens: [Int], into cache: [KVCache]) -> Int? {
@@ -1254,10 +2142,6 @@ actor PromptCache {
             return nil
         }
 
-        guard let cached, !cached.tokens.isEmpty else {
-            misses += 1
-            return nil
-        }
         // ── Recurrent-layer safety gate ──
         // MambaCache (and other recurrent caches) store a 2-D hidden state with no
         // T dimension, so the dim(2) read below would crash. Hybrid Mamba/attention
@@ -1272,39 +2156,26 @@ actor PromptCache {
             misses += 1
             return nil
         }
-        // Token-by-token longest common prefix scan
-        var matchLen = 0
-        for (a, b) in zip(cached.tokens, newTokens) {
-            guard a == b else { break }
-            matchLen += 1
+        var best: (index: Int, matchLen: Int)?
+        for (i, entry) in entries.enumerated() {
+            if let m = usableMatch(entry, newTokens: newTokens, cache: cache),
+               m > (best?.matchLen ?? 0)
+            {
+                best = (i, m)
+            }
         }
-        guard matchLen > 0 else {
+        guard let (index, matchLen) = best else {
             misses += 1
             return nil
         }
-        // Pre-flight safety check: compute the minimum sequence length across
-        // all cached layers. Sliding-window layers (RotatingKVCache) store far
-        // fewer tokens than the full prompt (e.g. 1440 vs 5537). If the trim
-        // would zero-out any layer, bail BEFORE touching the live cache.
+        let cached = entries.remove(at: index)
+        entries.insert(cached, at: 0)
         let excess = cached.tokens.count - matchLen
-        if excess > 0 {
-            // The state getter stores keys as the first element: [B, H, T, D]
-            // dim(2) = T = the number of cached tokens for that layer.
-            let minCachedSeqLen = cached.states.map { arrays -> Int in
-                guard let firstArray = arrays.first else { return 0 }
-                guard firstArray.ndim >= 3 else { return 0 }
-                return firstArray.dim(2)  // T dimension
-            }.min() ?? 0
-            if excess >= minCachedSeqLen {
-                // Trim would empty or corrupt at least one layer → treat as miss
-                misses += 1
-                return nil
-            }
-        }
-        // Safe to restore: trim won't corrupt any layer
+        // Safe to restore: trim won't corrupt any layer. Detach so decode steps on the
+        // live cache cannot write through into the saved snapshot.
         for i in 0..<min(cache.count, cached.states.count) {
             var layer = cache[i]
-            layer.state = cached.states[i]
+            layer.state = cached.states[i].map(detachedArray)
             layer.metaState = cached.metaStates[i]
         }
         if excess > 0 {
@@ -1315,7 +2186,207 @@ actor PromptCache {
         return matchLen
     }
 
+    /// Length of the common prefix between `entry` and `newTokens`, or nil when restoring
+    /// that entry into `cache` and trimming the excess would corrupt a layer.
+    private func usableMatch(_ entry: CachedState, newTokens: [Int], cache: [KVCache]) -> Int? {
+        guard !entry.tokens.isEmpty else { return nil }
+        let matchLen = Self.commonPrefixLength(entry.tokens, newTokens)
+        guard matchLen > 0 else { return nil }
+        // Pre-flight safety check: compute the minimum sequence length across
+        // all cached layers. Sliding-window layers (RotatingKVCache) store far
+        // fewer tokens than the full prompt (e.g. 1440 vs 5537). If the trim
+        // would zero-out any layer, bail BEFORE touching the live cache.
+        let excess = entry.tokens.count - matchLen
+        if excess > 0 {
+            // The state getter stores keys as the first element: [B, H, T, D]
+            // dim(2) = T = the number of cached tokens for that layer.
+            let minCachedSeqLen = entry.states.map { arrays -> Int in
+                guard let firstArray = arrays.first, firstArray.ndim >= 3 else { return 0 }
+                return firstArray.dim(2)
+            }.min() ?? 0
+            if excess >= minCachedSeqLen { return nil }
+        }
+        // A ring buffer that has evicted tokens (offset > maxSize) cannot be rewound by
+        // more than the one slot a full-match replay overwrites: trim(n >= 2) would leave
+        // the window pointing at evicted keys. Treat that as a miss.
+        let replayExtra = matchLen >= newTokens.count ? 1 : 0
+        for i in 0..<min(cache.count, entry.states.count) where cache[i] is RotatingKVCache {
+            if Self.ringHasDroppedTokens(metaState: entry.metaStates[i]), excess + replayExtra > 1 {
+                return nil
+            }
+        }
+        return matchLen
+    }
+
+    /// Hybrid-model restore. Recurrent state cannot be trimmed, only resumed, so a cached
+    /// sequence is reusable only if it is an exact prefix of `newTokens` no longer than
+    /// `limit`, or (when the prompt diverges from it) if it holds a recurrent checkpoint at
+    /// or before the divergence and the attention layers can be rewound to that point. The
+    /// entry that resumes the most tokens wins. Returns the resumed length (tokens now in
+    /// `cache`), or nil on a miss.
+    func restoreExactPrefix(newTokens: [Int], limit: Int, into cache: [KVCache]) -> Int? {
+        var best: (index: Int, length: Int, checkpoint: RecurrentCheckpoint?)?
+        for (i, e) in entries.enumerated() {
+            guard let r = hybridResumePoint(e, newTokens: newTokens, limit: limit, cache: cache),
+                  r.length > (best?.length ?? 0)
+            else { continue }
+            best = (i, r.length, r.checkpoint)
+        }
+        guard let (index, length, checkpoint) = best else {
+            misses += 1
+            return nil
+        }
+        let cached = entries.remove(at: index)
+        entries.insert(cached, at: 0)
+        for (i, layer) in cache.enumerated() {
+            var layer = layer
+            layer.state = cached.states[i].map(detachedArray)
+            // ArraysCache's metaState setter traps; it carries no metadata to restore.
+            if !(layer is MambaCache) { layer.metaState = cached.metaStates[i] }
+        }
+        if let checkpoint {
+            // Recurrent layers jump back to the checkpoint; attention layers drop the
+            // positions after it (`hybridResumePoint` checked they can).
+            for (i, state) in checkpoint.layers {
+                var layer = cache[i]
+                layer.state = state.map(detachedArray)
+            }
+            for layer in cache where !(layer is MambaCache) {
+                layer.trim(cached.tokens.count - length)
+            }
+        }
+        hits += 1
+        print("[SwiftLM] \u{1F5C2} Prompt cache HIT (hybrid): \(length)/\(newTokens.count) tokens reused"
+            + (checkpoint == nil ? "" : " (checkpoint of \(cached.tokens.count))"))
+        return length
+    }
+
+    /// How many tokens of `entry` a hybrid restore can resume, and the checkpoint to
+    /// resume from when that is short of the whole entry. Nil when it cannot.
+    private func hybridResumePoint(
+        _ entry: CachedState, newTokens: [Int], limit: Int, cache: [KVCache]
+    ) -> (length: Int, checkpoint: RecurrentCheckpoint?)? {
+        guard !entry.tokens.isEmpty, entry.states.count == cache.count else { return nil }
+        if entry.tokens.count <= limit, newTokens.starts(with: entry.tokens) {
+            return (entry.tokens.count, nil)
+        }
+        // Diverged (or longer than `limit`): the newest checkpoint inside the shared prefix.
+        let reach = min(Self.commonPrefixLength(entry.tokens, newTokens), limit)
+        guard let cp = entry.checkpoints.last(where: { $0.position <= reach }),
+              canRewindAttention(entry, cache: cache)
+        else { return nil }
+        return (cp.position, cp)
+    }
+
+    /// Whether every non-recurrent layer of `entry` can be trimmed exactly: a plain KV
+    /// cache always can; a sliding-window ring only until it fills (the same predicate as
+    /// `RotatingKVCache.isTrimmable(after:)`, read from the saved metaState because the
+    /// live cache has not been restored yet).
+    private func canRewindAttention(_ entry: CachedState, cache: [KVCache]) -> Bool {
+        for (i, layer) in cache.enumerated() {
+            if layer is MambaCache || type(of: layer) == KVCacheSimple.self { continue }
+            guard layer is RotatingKVCache, entry.metaStates[i].count > 3,
+                  let maxSize = Int(entry.metaStates[i][1]), let offset = Int(entry.metaStates[i][3]),
+                  offset < maxSize
+            else { return false }
+        }
+        return true
+    }
+
     func stats() -> (hits: Int, misses: Int) { (hits, misses) }
+}
+
+/// Where a hybrid (recurrent + attention) model's prompt cache may snapshot: the index
+/// of the last `<|im_start|>`, i.e. the start of the turn being generated.
+///
+/// Everything before it is history that the next agent request re-renders identically.
+/// The generation prompt after it (`assistant\n<think>…`) is not always a prefix of
+/// its own re-rendered form. Returns nil when the model is not hybrid, the template is
+/// not ChatML, or there is no history to cache.
+///
+/// The attention layers may be KVCacheSimple or, under `--ctx-size`, RotatingKVCache.
+/// A ring is safe here even once it has wrapped: this path never trims, it restores the
+/// exact snapshot taken at the boundary, and the ring's state + metaState round-trip it.
+func hybridCacheBoundary(promptTokens: [Int], imStartId: Int?, cache: [KVCache]) -> Int? {
+    guard let imStartId,
+          cache.contains(where: { $0 is MambaCache }),
+          cache.allSatisfy({
+              $0 is MambaCache || type(of: $0) == KVCacheSimple.self
+                  || type(of: $0) == RotatingKVCache.self
+          }),
+          let boundary = promptTokens.lastIndex(of: imStartId), boundary > 0
+    else { return nil }
+    return boundary
+}
+
+/// Prompt positions at which a hybrid prefill from `start` to `boundary` should snapshot
+/// its recurrent state: turn starts, so a later prompt that edits history shares a prefix
+/// that ends on a turn boundary. A cold prefill (`start == 0`) first takes the turn after
+/// the system prompt (the anchor, which survives every later edit to the conversation);
+/// after that, a turn start only once `minGap` tokens have passed since the last snapshot
+/// (the resume point counts as one), which bounds how much an edit has to re-prefill.
+func hybridCheckpointPositions(
+    promptTokens: [Int], imStartId: Int?, start: Int, boundary: Int, minGap: Int = 2048
+) -> [Int] {
+    guard let imStartId else { return [] }
+    let turnStarts = promptTokens.indices.filter { promptTokens[$0] == imStartId }
+    var positions: [Int] = []
+    var last = start
+    if start == 0, turnStarts.count > 1, turnStarts[1] < boundary {
+        positions.append(turnStarts[1])
+        last = turnStarts[1]
+    }
+    for i in turnStarts where i > last && i < boundary && i - last >= minGap {
+        positions.append(i)
+        last = i
+    }
+    return positions
+}
+
+/// Detached, evaluated copy of every recurrent layer's state, keyed by layer index. The
+/// live arrays are overwritten by the next prefill segment, so they must not be shared.
+func recurrentSnapshot(_ cache: [KVCache]) -> [Int: [MLXArray]] {
+    var layers: [Int: [MLXArray]] = [:]
+    for (i, layer) in cache.enumerated() where layer is MambaCache {
+        layers[i] = layer.state.map(detachedArray)
+    }
+    eval(layers.values.flatMap { $0 })
+    return layers
+}
+
+/// Copy-on-write snapshot of a cache state array. RotatingKVCache (and the KVCacheSimple
+/// setter) update their buffers in place, which would otherwise write through into a
+/// saved or restored snapshot that shares them.
+func detachedArray(_ a: MLXArray) -> MLXArray {
+    a.ndim == 0 ? a : a[0...]
+}
+
+/// Slice `text` along the sequence axis, keeping its rank and slicing the mask with it.
+/// VLM processors return `[1, T]` tokens, where an axis-0 slice would cut the batch axis.
+func sliceText(_ text: LMInput.Text, from start: Int, to end: Int? = nil) -> LMInput.Text {
+    let stop = end ?? text.tokens.dim(-1)
+    return text.tokens.ndim >= 2 ? text[0..., start ..< stop] : text[start ..< stop]
+}
+
+/// Whether the prompt cache must be bypassed for a request.
+///
+/// VLM/Omni loads are skipped except for models whose text-only path is stateless: the
+/// Qwen-VL family needs the LMOutput.State (ropeDeltas) of the cached prefix, which the
+/// cache does not store.
+func shouldSkipPromptCache(
+    isMultimodalRequest: Bool, kvBitsSet: Bool, isVLM: Bool, vlmTextCacheSafe: Bool
+) -> Bool {
+    isMultimodalRequest || kvBitsSet || (isVLM && !vlmTextCacheSafe)
+}
+
+/// Where a cache containing sliding-window (RotatingKVCache) layers may snapshot: the
+/// start of the turn being generated (last `<|turn>` / `<|im_start|>`), else the end of
+/// the prompt. Ring buffers have to be saved synchronously at a known length — after the
+/// first decode token the window has already moved on.
+func rotatingCacheBoundary(promptTokens: [Int], turnStartIds: [Int?]) -> Int {
+    let ids = Set(turnStartIds.compactMap { $0 })
+    if let b = promptTokens.lastIndex(where: { ids.contains($0) }), b > 0 { return b }
+    return promptTokens.count
 }
 
 // ── Request Body Extraction ──────────────────────────────────────────────────
@@ -1324,6 +2395,73 @@ func collectBody(_ request: Request) async throws -> Data {
     var bodyBuffer = try await request.body.collect(upTo: 100 * 1024 * 1024)
     let bodyBytes = bodyBuffer.readBytes(length: bodyBuffer.readableBytes) ?? []
     return Data(bodyBytes)
+}
+
+/// The end-of-sequence set the standard path stops on (`buildStopTokenIds` in
+/// mlx-swift-lm): the configuration's ids, the tokenizer's EOS and the extra EOS tokens
+/// resolved through the tokenizer. DFlash takes it as a list.
+func stopTokenIDs(
+    eosTokenIDs: Set<Int>, tokenizerEOS: Int?, extraEOSTokens: Set<String>,
+    tokenID: (String) -> Int?
+) -> [Int] {
+    var ids = eosTokenIDs
+    if let tokenizerEOS { ids.insert(tokenizerEOS) }
+    for token in extraEOSTokens {
+        if let id = tokenID(token) { ids.insert(id) }
+    }
+    return ids.sorted()
+}
+
+/// Mutable detokenizer shared with the bridge task in `dflashGenerationStream`.
+private final class DetokenizerBox: @unchecked Sendable {
+    var detokenizer: NaiveStreamingDetokenizer
+    init(_ d: NaiveStreamingDetokenizer) { self.detokenizer = d }
+}
+
+/// Bridges a DFlash event stream to the `Generation` stream the handlers consume.
+///
+/// When the consumer stops early — a text-level stop sequence, a client disconnect — the
+/// returned stream is torn down, which cancels the bridge task; that ends the DFlash
+/// stream and, through its own `onTermination`, the DFlash generation task. Before this
+/// the bridge was a bare `Task` nobody cancelled, so the DFlash loop ran on to
+/// `max_tokens` after the response had ended and the next request's generation
+/// overlapped it (#224).
+func dflashGenerationStream(
+    _ events: AsyncStream<DFlashEvent>,
+    tokenLimit: Int,
+    nextText: @escaping @Sendable (Int) -> String?
+) -> AsyncStream<Generation> {
+    AsyncStream<Generation> { continuation in
+        let bridge = Task {
+            for await event in events {
+                if Task.isCancelled { break }
+                switch event {
+                case .token(let tokenID, _, _, _):
+                    if let chunk = nextText(tokenID) {
+                        continuation.yield(.chunk(chunk, tokenId: tokenID, logprob: 0))
+                    }
+                case .prefill, .prefillProgress:
+                    break
+                case .summary(let summary):
+                    print("[SwiftLM] DFlash summary: \(summary.generationTokens) tokens, \(String(format: "%.1f", summary.tokensPerSecond)) tok/s, acceptance=\(String(format: "%.1f%%", summary.acceptanceRatio * 100)), \(summary.cyclesCompleted) cycles")
+                    // The SSE/non-streaming handlers emit finish_reason, usage and
+                    // `[DONE]` from `.info`. Without it, a DFlash run that ends on EOS
+                    // or max_tokens (rather than a textual stop sequence) closes the
+                    // stream with no `[DONE]` sentinel.
+                    let prefillSec = summary.phaseTimingsUs.prefill / 1_000_000.0
+                    continuation.yield(.info(GenerateCompletionInfo(
+                        promptTokenCount: summary.promptTokenCount,
+                        generationTokenCount: summary.generationTokens,
+                        promptTime: prefillSec,
+                        generationTime: summary.elapsedUs / 1_000_000.0 - prefillSec,
+                        stopReason: summary.generationTokens >= tokenLimit ? .length : .stop
+                    )))
+                }
+            }
+            continuation.finish()
+        }
+        continuation.onTermination = { _ in bridge.cancel() }
+    }
 }
 
 // ── Chat Completions Handler ─────────────────────────────────────────────────
@@ -1340,21 +2478,27 @@ func handleChatCompletion(
     numDraftTokens: Int = 4,
     dflashModel: DFlashDraftModel? = nil,
     dflashBlockSize: Int? = nil,
-    dflashTargetModel: (any DFlashTargetModel)? = nil
+    dflashTargetModel: (any DFlashTargetModel)? = nil,
+    mtpAssistant: (any DualModelMTP)? = nil
 ) async throws -> Response {
-    let chatReq = try JSONDecoder().decode(ChatCompletionRequest.self, from: bodyData)
+    let chatReq: ChatCompletionRequest
+    do {
+        chatReq = try JSONDecoder().decode(ChatCompletionRequest.self, from: bodyData)
+    } catch let error as DecodingError {
+        return invalidRequestResponse(error)
+    }
     let isStream = chatReq.stream ?? false
     let jsonMode = chatReq.responseFormat?.type == "json_object"
     let emitPrefillProgress = prefillProgressEnabled(in: request)
 
     // ── Merge per-request overrides with CLI defaults ──
-    let tokenLimit = chatReq.maxTokens ?? config.maxTokens
+    let tokenLimit = chatReq.maxTokens ?? chatReq.maxCompletionTokens ?? config.maxTokens
     let temperature = chatReq.temperature.map(Float.init) ?? config.temp
     let topP = chatReq.topP.map(Float.init) ?? config.topP
     let topK = chatReq.topK ?? config.topK ?? 50
     let minP = chatReq.minP.map(Float.init) ?? config.minP ?? 0.0
     let repeatPenalty = chatReq.repetitionPenalty.map(Float.init) ?? config.repeatPenalty
-    let stopSequences = (chatReq.stop ?? []) + ["<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<turn|>", "<|tool_response|>"]
+    let stopSequences = (chatReq.stop?.values ?? []) + ["<end_of_turn>", "<|im_end|>", "<|eot_id|>", "<turn|>", "<|tool_response|>"]
     let includeUsage = chatReq.streamOptions?.includeUsage ?? false
 
     // Log extra sampling params if provided (accepted for API compat, not all are used)
@@ -1372,7 +2516,7 @@ func handleChatCompletion(
         )
     }
 
-    let params = GenerateParameters(
+    var generateParams = GenerateParameters(
         maxTokens: tokenLimit,
         maxKVSize: config.ctxSize,
         kvBits: chatReq.kvBits,
@@ -1383,43 +2527,25 @@ func handleChatCompletion(
         repetitionPenalty: repeatPenalty,
         prefillStepSize: config.prefillSize
     )
-
-    // ── Seed for deterministic generation ──
-    if let seed = chatReq.seed {
-        MLXRandom.seed(UInt64(seed))
-    }
+    generateParams.prefill.progress = forwardPrefillProgress
+    // ── Seed ──
+    // The samplers draw from their own RandomState, which only `GenerateParameters.seed`
+    // seeds; seeding the global generator alone left the request's `seed` without any
+    // effect (#219). The global generator is still seeded for the paths that call
+    // MLXRandom directly.
+    let seed = samplingSeed(chatReq.seed)
+    generateParams.seed = seed
+    if let seed { MLXRandom.seed(seed) }
+    let params = generateParams
 
     // ── Parse messages with multipart content support (for VLM images) ──
     var chatMessages: [Chat.Message] = []
     var systemPromptText = ""
     for msg in chatReq.messages {
-        let textContent = msg.textContent
-        let images = msg.extractImages()
-        let audio = msg.extractAudio()
-        switch msg.role {
-        case "system", "developer":
-            chatMessages.append(.system(textContent, images: images, audio: audio))
-            systemPromptText += textContent
-        case "assistant":
-            var formattedToolCalls: [[String: any Sendable]]? = nil
-            if let tc = msg.tool_calls, !tc.isEmpty {
-                formattedToolCalls = tc.enumerated().map { (index, call) in
-                    [
-                        "index": index,
-                        "id": call.id,
-                        "type": call.type,
-                        "function": [
-                            "name": call.function.name,
-                            "arguments": call.function.arguments
-                        ] as [String: any Sendable]
-                    ] as [String: any Sendable]
-                }
-            }
-            chatMessages.append(.assistant(textContent, images: images, audio: audio, toolCalls: formattedToolCalls))
-        case "tool":
-            chatMessages.append(.tool(textContent, toolCallId: msg.tool_call_id))
-        default:
-            chatMessages.append(.user(textContent, images: images, audio: audio))
+        let chatMsg = msg.toChatMessage()
+        chatMessages.append(chatMsg)
+        if chatMsg.role == .system {
+            systemPromptText += chatMsg.content
         }
     }
 
@@ -1448,6 +2574,7 @@ func handleChatCompletion(
 
     // ── Acquire slot (concurrency limiter) ──
     await semaphore.wait()
+    let slot = GenerationSlot(semaphore: semaphore)
     await stats.requestStarted()
     let genStart = Date()
 
@@ -1492,18 +2619,68 @@ func handleChatCompletion(
     // true, it evaluates to false and still breaks. We MUST explicitly pass the boolean.
     let templateContext: [String: any Sendable] = ["enable_thinking": enableThinking]
     let userInput = UserInput(chat: chatMessages, tools: toolSpecs, additionalContext: templateContext)
-    print("[Server Debug] Created UserInput with \(userInput.images.count) images and \(userInput.audio.count) audio inputs.")
+    print("[Server Debug] Created UserInput with \(userInput.images.count) images and \(userInput.audios.count) audio inputs.")
     let lmInput = try await container.prepare(input: userInput)
 
     // ── Prompt caching: full token sequence for prefix matching ──
     let promptTokenCount = lmInput.text.tokens.size
+    if let rejection = await rejectLongPrompt(
+        promptTokens: promptTokenCount, limit: config.maxPromptTokens, slot: slot, stats: stats)
+    {
+        return rejection
+    }
     let promptTokens = lmInput.text.tokens.asArray(Int.self)
+
+    // ── Reasoning budget: per-request `thinking_budget` wins over `--thinking-budget` ──
+    let budgetComponents: GenerationComponents?
+    do {
+        budgetComponents = try thinkingBudgetComponents(
+            budget: chatReq.thinkingBudget ?? config.thinkingBudget, enableThinking: enableThinking,
+            reasoning: await container.configuration.reasoningConfig,
+            tokenizer: await container.tokenizer, parameters: params)
+    } catch let error as ThinkingBudgetError {
+        print("srv  slot_reject: id 0 | thinking budget: \(error.errorDescription ?? "invalid")")
+        slot.release()
+        await stats.requestFinished(tokens: 0, duration: 0)
+        return Response(
+            status: .badRequest, headers: jsonHeaders(),
+            body: .init(byteBuffer: ByteBuffer(string: thinkingBudgetErrorBody(error))))
+    }
+    let genComponents = budgetComponents ?? GenerationComponents()
+    if budgetComponents != nil, draftModelRef != nil || config.mtp || dflashModel != nil {
+        print("[SwiftLM] Warning: the thinking budget is not applied with speculative, MTP or DFlash decoding.")
+    }
+
+    // ── Issue #108: does the template leave the thinking block open? ──
+    // Qwen3/3.5/3.6 templates append `<think>\n` to the generation prompt when
+    // enable_thinking is true, so the model emits reasoning with no opening tag of
+    // its own and the parser would misfile all of it as response content. Decoding
+    // the prompt tail detects this without hard-coding any particular template:
+    // 32 tokens comfortably covers the trailing `<|im_start|>assistant\n<think>\n`
+    // while keeping the decode negligible.
+    var thinkingPreOpened = false
+    if enableThinking {
+        let tail = await container.tokenizer.decode(tokenIds: Array(promptTokens.suffix(32)), skipSpecialTokens: false)
+        thinkingPreOpened = ThinkingStateTracker.opensUnclosedThinkingBlock(tail)
+        if thinkingPreOpened {
+            print("[SwiftLM] Chat template pre-opened the thinking block — parsing output as reasoning until the closing tag.")
+        }
+    }
 
     // llama-server style: announce prefill start
     print("srv  slot_launch: id 0 | prompt=\(promptTokenCount)t | thinking=\(enableThinking) | prefilling...")
     fflush(stdout)
     let prefillStart = Date()
 
+    let modelId = config.modelId
+
+    // ── Generation start (deferred for streaming) ──
+    // For streaming responses this closure runs inside the SSE consumer task
+    // AFTER the response headers are on the wire, so a long prefill cannot
+    // leave the client staring at a silent connection (client idle-timeout →
+    // ECONNRESET → retry with an ever-grown payload). Non-streaming awaits it
+    // inline, exactly as before. (Body indentation intentionally unchanged.)
+    let startGeneration: () async throws -> (AsyncStream<Generation>, (() async -> Void)?) = {
     // ── DFlash block-diffusion speculative decoding ──
     // When --dflash is enabled and both DFlash draft model and target model conform
     // to DFlashTargetModel, we use DFlashRuntime.generate instead of the standard path.
@@ -1513,72 +2690,49 @@ func handleChatCompletion(
         fflush(stdout)
         // Convert DFlashEvent stream to Generation stream with proper streaming detokenizer
         let dflashTokenizer = await container.tokenizer
+        let dflashConfiguration = await container.configuration
         let dflashStream = DFlashRuntime.generate(
             targetModel: targetModel,
             draftModel: dflashDraft,
             promptTokens: promptTokens,
             maxNewTokens: tokenLimit,
-            blockTokens: dflashBlockSize
+            blockTokens: dflashBlockSize,
+            // The end-of-sequence set the standard path stops on. Without it DFlash ran
+            // to max_tokens past `<|im_end|>` (#224).
+            stopTokenIDs: stopTokenIDs(
+                eosTokenIDs: dflashConfiguration.eosTokenIds,
+                tokenizerEOS: dflashTokenizer.eosTokenId,
+                extraEOSTokens: dflashConfiguration.extraEOSTokens,
+                tokenID: dflashTokenizer.convertTokenToId)
         )
-
-        // Use a class wrapper so the detokenizer can be mutated inside the closure
-        final class DetokenizerBox: @unchecked Sendable {
-            var detokenizer: NaiveStreamingDetokenizer
-            init(_ d: NaiveStreamingDetokenizer) { self.detokenizer = d }
-        }
         let box = DetokenizerBox(NaiveStreamingDetokenizer(tokenizer: dflashTokenizer))
-
-        let genStream = AsyncStream<Generation> { continuation in
-            Task {
-                for await event in dflashStream {
-                    switch event {
-                    case .token(let tokenID, _, _, _):
-                        box.detokenizer.append(token: tokenID)
-                        if let chunk = box.detokenizer.next() {
-                            continuation.yield(.chunk(chunk, tokenId: tokenID, logprob: 0))
-                        }
-                    case .prefill, .prefillProgress:
-                        break
-                    case .summary(let summary):
-                        print("[SwiftLM] DFlash summary: \(summary.generationTokens) tokens, \(String(format: "%.1f", summary.tokensPerSecond)) tok/s, acceptance=\(String(format: "%.1f%%", summary.acceptanceRatio * 100)), \(summary.cyclesCompleted) cycles")
-                    }
-                }
-                continuation.finish()
-            }
+        let genStream = dflashGenerationStream(dflashStream, tokenLimit: tokenLimit) { tokenID in
+            box.detokenizer.append(token: tokenID)
+            return box.detokenizer.next()
         }
 
-        let modelId = config.modelId
-        if isStream {
-            return handleChatStreaming(
-                stream: genStream, modelId: modelId, stopSequences: stopSequences,
-                includeUsage: includeUsage, promptTokenCount: promptTokenCount,
-                enableThinking: enableThinking, jsonMode: jsonMode,
-                logprobs: chatReq.logprobs == true, semaphore: semaphore,
-                stats: stats, genStart: genStart, prefillStart: prefillStart,
-                emitPrefillProgress: false, onPrefillDone: nil
-            )
-        } else {
-            return try await handleChatNonStreaming(
-                stream: genStream, modelId: modelId, stopSequences: stopSequences,
-                promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-                jsonMode: jsonMode, logprobs: chatReq.logprobs == true, semaphore: semaphore,
-                stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: nil
-            )
-        }
+        return (genStream, nil)
     }
 
     // ── Cache-aware generation (standard path) ──
     let (stream, onPrefillDone) = try await container.perform { context -> (AsyncStream<Generation>, (() async -> Void)?) in
-        let cache = context.model.newCache(parameters: params)
+        let cache = try context.model.newCache(parameters: params)
 
         // ── TurboQuant: enable 3-bit KV compression on every KVCacheSimple layer ──
         // This compresses cache history older than 8192 tokens into 3.5-bit Polar+QJL
         // form, halving KV RAM for long-context (100k+) requests.
         if config.turboKV {
+            var enabledLayers = 0
             for layer in cache {
                 if let simple = layer as? KVCacheSimple {
                     simple.turboQuantEnabled = true
+                    enabledLayers += 1
                 }
+            }
+            if enabledLayers == 0 && !TurboKVNotice.warnedNoLayers {
+                // Warn once. A benign race here only means a duplicate log line.
+                TurboKVNotice.warnedNoLayers = true
+                print("[SwiftLM] ⚠️  --turbo-kv is enabled but this model's cache has no KVCacheSimple layers (\(cache.count) layers, e.g. RotatingKVCache from --ctx-size), so no KV compression is applied.")
             }
         }
 
@@ -1587,7 +2741,7 @@ func handleChatCompletion(
         // requests (image/audio), prepare() must inject the vision/audio feature embeddings
         // before the language model runs. A cache hit would skip that injection, feeding
         // raw <|image|>/<|audio|> token embeddings instead of the projected features.
-        let isMultimodalRequest = lmInput.image != nil || lmInput.audio != nil
+        let isMultimodalRequest = lmInput.image != nil || lmInput.video != nil || lmInput.audio != nil
 
         // ── Decision branch ──
         // Speculative decoding is CHECKED FIRST because a cache-hit rollback
@@ -1597,9 +2751,106 @@ func handleChatCompletion(
         // Skip prompt cache for quantized-KV requests: the prompt cache stores KV state
         // produced with KVCacheSimple; restoring it into a QuantizedKVCache (or vice-versa)
         // is unsafe and produces incorrect results or runtime failures.
-        let skipPromptCache = isMultimodalRequest || params.kvBits != nil
+        //
+        // Skip it for VLM/Omni-loaded models too, except Gemma 4: models such as
+        // Qwen3.5/Qwen3-VL need the LMOutput.State (ropeDeltas) of the cached prefix, which
+        // the prompt cache does not store, whereas Gemma 4's text-only path is stateless.
+        // Checked on the model type rather than config.isVision so --audio
+        // (OmniModelFactory) loads are covered as well.
+        let isVLM = context.model is any VLMModel
+        let vlmTextCacheSafe = context.model is MLXVLM.Gemma4 && !config.mtp && mtpAssistant == nil
+        let skipPromptCache = shouldSkipPromptCache(
+            isMultimodalRequest: isMultimodalRequest, kvBitsSet: params.kvBits != nil,
+            isVLM: isVLM, vlmTextCacheSafe: vlmTextCacheSafe)
+        let promptLength = promptTokens.count
+
+        // ── Hybrid (recurrent + attention) prompt cache ──
+        // Qwen3.5/3.6-style models pair MambaCache (linear attention) with KVCacheSimple
+        // layers (RotatingKVCache under --ctx-size; this path must run before the
+        // sliding-window one, which misses on any MambaCache), and the generic path below
+        // refuses them: recurrent state cannot be
+        // trimmed, and the onPrefillDone save runs after the first decode token has been
+        // fed. Without this, every agent turn re-prefills the whole conversation. Instead:
+        // resume from an exact cached prefix, prefill to the turn boundary, snapshot there
+        // synchronously, then generate the few tokens after it.
+        let hybridBoundary = (skipPromptCache || draftModelRef != nil || config.mtp || config.turboKV)
+            ? nil
+            : hybridCacheBoundary(
+                promptTokens: promptTokens,
+                imStartId: context.tokenizer.convertTokenToId("<|im_start|>"), cache: cache)
+        // ── Sliding-window (RotatingKVCache) prompt cache ──
+        // Same reasoning as the hybrid path: the late save below runs one decode token after
+        // the prompt, when the ring buffer no longer lines up with `promptTokens`. Snapshot
+        // synchronously at the turn boundary instead.
+        let hasRotatingLayer = cache.contains { $0 is RotatingKVCache }
+        let rotatingBoundary: Int? = (skipPromptCache || hybridBoundary != nil || draftModelRef != nil
+            || config.mtp || config.turboKV || !hasRotatingLayer)
+            ? nil
+            : rotatingCacheBoundary(
+                promptTokens: promptTokens,
+                turnStartIds: [
+                    context.tokenizer.convertTokenToId("<|turn>"),
+                    context.tokenizer.convertTokenToId("<|im_start|>"),
+                ])
         var stream: AsyncStream<Generation>
-        if let draftRef = draftModelRef {
+        if let boundary = hybridBoundary {
+            let start = await promptCache.restoreExactPrefix(
+                newTokens: promptTokens, limit: boundary, into: cache) ?? 0
+            if start < boundary {
+                // TokenIterator.init prefills its input into `cache` (same chunking and
+                // SSD-streaming error handling as a cold prefill), then samples one token
+                // without feeding it back, so the cache ends at exactly its input's end.
+                // Prefill in segments, snapshotting the recurrent layers between them, so a
+                // later prompt that edits earlier history can resume from the last snapshot
+                // before the edit instead of from zero.
+                let cuts = hybridCheckpointPositions(
+                    promptTokens: promptTokens,
+                    imStartId: context.tokenizer.convertTokenToId("<|im_start|>"),
+                    start: start, boundary: boundary)
+                var checkpoints: [RecurrentCheckpoint] = []
+                var from = start
+                for stop in cuts + [boundary] {
+                    _ = try TokenIterator(
+                        input: LMInput(text: sliceText(lmInput.text, from: from, to: stop)),
+                        model: context.model, cache: cache, parameters: params)
+                    if stop < boundary {
+                        checkpoints.append(
+                            RecurrentCheckpoint(position: stop, layers: recurrentSnapshot(cache)))
+                    }
+                    from = stop
+                }
+                await promptCache.save(
+                    tokens: Array(promptTokens[..<boundary]), cache: cache, allowRecurrent: true,
+                    checkpoints: checkpoints, resumedFrom: start)
+            }
+            stream = try MLXLMCommon.generate(
+                input: LMInput(text: sliceText(lmInput.text, from: boundary)),
+                cache: cache, parameters: params, context: context, components: genComponents)
+        } else if let boundary = rotatingBoundary {
+            var start = await promptCache.restore(newTokens: promptTokens, into: cache) ?? 0
+            if start >= promptLength {
+                // Full match: replay the last token to get next-token logits.
+                start = promptLength - 1
+                for layer in cache { layer.trim(1) }
+            }
+            if start < boundary {
+                // TokenIterator.init prefills into `cache` and leaves it at exactly `boundary`.
+                _ = try TokenIterator(
+                    input: LMInput(text: sliceText(lmInput.text, from: start, to: boundary)),
+                    model: context.model, cache: cache, parameters: params)
+                await promptCache.save(tokens: Array(promptTokens[..<boundary]), cache: cache)
+                start = boundary
+            }
+            if start >= promptLength {
+                // The boundary is the end of the prompt; step back one token (exact on a
+                // ring buffer) so there is something to feed.
+                start = promptLength - 1
+                for layer in cache { layer.trim(1) }
+            }
+            stream = try MLXLMCommon.generate(
+                input: LMInput(text: sliceText(lmInput.text, from: start)),
+                cache: cache, parameters: params, context: context, components: genComponents)
+        } else if let draftRef = draftModelRef {
             // Speculative decoding path: draft model generates candidates, main model verifies.
             // Bypass prompt cache to avoid draft/main KV drift on partial-match restores.
             print("[SwiftLM] Using speculative decoding (\(numDraftTokens) draft tokens/round)")
@@ -1612,33 +2863,34 @@ func handleChatCompletion(
             // Cache hit: KV state is pre-populated up to cachedCount tokens.
             // Only compute the remaining (new) tokens.
             var startIndex = cachedCount
-            if startIndex >= lmInput.text.tokens.count {
+            if startIndex >= promptLength {
                 // Full match: all tokens are cached. We still need to feed at least
                 // the last token so the model can produce next-token logits.
-                startIndex = lmInput.text.tokens.count - 1
+                startIndex = promptLength - 1
                 // Trim the KV cache back by 1 to avoid double-counting the replayed token.
                 for layer in cache { layer.trim(1) }
             }
-            let remainingTokens = lmInput.text.tokens[startIndex...]
-            let trimmedInput = LMInput(tokens: remainingTokens)
-            if config.mtp, context.model is any MTPLanguageModel {
+            let trimmedInput = LMInput(text: sliceText(lmInput.text, from: startIndex))
+            if config.mtp, let mtpCtx = mtpContext(main: context, assistant: mtpAssistant) {
                 stream = try MLXLMCommon.generateMTP(
-                    input: trimmedInput, cache: cache, parameters: params, context: context, numMTPTokens: config.numMtpTokens
+                    input: trimmedInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
                 )
             } else {
                 stream = try MLXLMCommon.generate(
-                    input: trimmedInput, cache: cache, parameters: params, context: context
+                    input: trimmedInput, cache: cache, parameters: params, context: context,
+                    components: genComponents
                 )
             }
         } else {
             // Cache miss: process the full prompt.
-            if config.mtp, context.model is any MTPLanguageModel {
+            if config.mtp, let mtpCtx = mtpContext(main: context, assistant: mtpAssistant) {
                 stream = try MLXLMCommon.generateMTP(
-                    input: lmInput, cache: cache, parameters: params, context: context, numMTPTokens: config.numMtpTokens
+                    input: lmInput, cache: cache, parameters: params, context: mtpCtx, numMTPTokens: config.numMtpTokens
                 )
             } else {
                 stream = try MLXLMCommon.generate(
-                    input: lmInput, cache: cache, parameters: params, context: context
+                    input: lmInput, cache: cache, parameters: params, context: context,
+                    components: genComponents
                 )
             }
         }
@@ -1660,6 +2912,14 @@ func handleChatCompletion(
             return false
         }
         let onPrefillDone: (() async -> Void)? = {
+            // The hybrid path already saved at its boundary; a save here would capture
+            // recurrent state one decode token too late.
+            guard hybridBoundary == nil, rotatingBoundary == nil else { return }
+            // Nothing would ever restore it (see skipPromptCache above).
+            guard !skipPromptCache else { return }
+            // A ring buffer cannot be snapshotted after the first decode token (the MTP,
+            // draft and TurboKV paths land here with rotating layers).
+            guard !hasRotatingLayer else { return }
             if turboHasCompressed {
                 print("[SwiftLM] 🧠 Skipping prompt cache save — TurboQuant has compressed \(cache.compactMap { ($0 as? KVCacheSimple)?.compressedOffset }.max() ?? 0) tokens. Saving would decode ~37 GB back to fp16.")
             } else if params.kvBits != nil {
@@ -1672,24 +2932,26 @@ func handleChatCompletion(
         }
         return (stream, onPrefillDone)
     }
-
-    let modelId = config.modelId
+        return (stream, onPrefillDone)
+    }  // end startGeneration
 
     if isStream {
         return handleChatStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
+            startGeneration: startGeneration, modelId: modelId, stopSequences: stopSequences,
             includeUsage: includeUsage, promptTokenCount: promptTokenCount,
-            enableThinking: enableThinking, jsonMode: jsonMode,
-            logprobs: chatReq.logprobs == true, semaphore: semaphore,
+            enableThinking: enableThinking, thinkingPreOpened: thinkingPreOpened,
+            jsonMode: jsonMode, logprobs: chatReq.logprobs == true, tokenEcho: config.tokenEcho, slot: slot,
             stats: stats, genStart: genStart, prefillStart: prefillStart,
-            emitPrefillProgress: emitPrefillProgress, onPrefillDone: onPrefillDone
+            emitPrefillProgress: emitPrefillProgress
         )
     } else {
+        let (stream, onPrefillDone) = try await startGeneration()
         return try await handleChatNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
             promptTokenCount: promptTokenCount, enableThinking: enableThinking,
-            jsonMode: jsonMode, logprobs: chatReq.logprobs == true, semaphore: semaphore,
-            stats: stats, genStart: genStart, prefillStart: prefillStart, onPrefillDone: onPrefillDone
+            thinkingPreOpened: thinkingPreOpened, jsonMode: jsonMode, logprobs: chatReq.logprobs == true, tokenEcho: config.tokenEcho,
+            slot: slot, stats: stats, genStart: genStart, prefillStart: prefillStart,
+            onPrefillDone: onPrefillDone
         )
     }
 }
@@ -1705,6 +2967,47 @@ struct ThinkingStateTracker {
     private(set) var phase: Phase = .responding
     private var buffer = ""  // accumulates chars looking for tag boundaries
 
+    /// Opening/closing tag spellings, longest-first so `<thinking>` is preferred
+    /// over the `<think>` prefix when both could match.
+    static let openTags = ["<thinking>", "<think>", "<|channel>thought\n", "<|channel>thought"]
+    static let closeTags = ["</thinking>", "</think>", "<channel|>"]
+
+    /// - Parameter startInThinking: true when the chat template already emitted an
+    ///   unclosed opening tag at the end of the prompt, so the model's first token
+    ///   is reasoning rather than response text (issue #108).
+    init(startInThinking: Bool = false) {
+        self.phase = startInThinking ? .thinking : .responding
+    }
+
+    /// Whether a rendered prompt ends inside an unclosed thinking block.
+    ///
+    /// Qwen3/3.5/3.6 templates append `<think>\n` to the generation prompt when
+    /// enable_thinking is true (and `<think>\n\n</think>\n\n` when it is false), so
+    /// the opening tag never appears in the model's own output. Comparing the last
+    /// opening tag against the last closing tag distinguishes the two cases.
+    static func opensUnclosedThinkingBlock(_ prompt: String) -> Bool {
+        func lastRange(of tags: [String]) -> Range<String.Index>? {
+            // Latest start wins; on a tie the longest tag wins, so `<thinking>` is
+            // never resolved as `<think>` + "ing>" regardless of openTags order.
+            tags.compactMap { prompt.range(of: $0, options: .backwards) }
+                .max { a, b in
+                    a.lowerBound == b.lowerBound
+                        ? a.upperBound < b.upperBound
+                        : a.lowerBound < b.lowerBound
+                }
+        }
+        guard let lastOpen = lastRange(of: openTags) else { return false }
+        if let lastClose = lastRange(of: closeTags), lastClose.lowerBound > lastOpen.lowerBound {
+            return false
+        }
+        // The tag must be the last thing in the prompt. A template that pre-opens always
+        // ends `…<|im_start|>assistant\n<think>\n`, whereas a `<think>` mentioned in the
+        // conversation itself is followed by more text — and treating that as pre-opened
+        // would route the model's entire answer into reasoning_content, leaving content
+        // empty (e.g. a user asking "explain the <think> tag").
+        return prompt[lastOpen.upperBound...].allSatisfy { $0.isWhitespace }
+    }
+
     /// Feed the next text fragment. Returns (reasoningContent, responseContent)
     /// where either value may be empty but never both non-empty simultaneously.
     mutating func process(_ text: String) -> (reasoning: String, content: String) {
@@ -1715,13 +3018,13 @@ struct ThinkingStateTracker {
         while !buffer.isEmpty {
             switch phase {
             case .responding:
-                let startRange = buffer.range(of: "<thinking>") ?? buffer.range(of: "<think>") ?? buffer.range(of: "<|channel>thought\n") ?? buffer.range(of: "<|channel>thought")
+                let startRange = Self.firstRange(in: buffer, of: Self.openTags)
                 if let range = startRange {
                     // Flush text before the tag as response content
                     content += String(buffer[buffer.startIndex..<range.lowerBound])
                     buffer.removeSubrange(buffer.startIndex..<range.upperBound)
                     phase = .thinking
-                } else if isSuffixOfTag(buffer, tags: ["<think>", "<thinking>", "<|channel>thought\n", "<|channel>thought"]) {
+                } else if isSuffixOfTag(buffer, tags: Self.openTags) {
                     // Partial tag — hold in buffer until we know more
                     return (reasoning, content)
                 } else {
@@ -1729,13 +3032,13 @@ struct ThinkingStateTracker {
                     buffer = ""
                 }
             case .thinking:
-                let endRange = buffer.range(of: "</thinking>") ?? buffer.range(of: "</think>") ?? buffer.range(of: "<channel|>")
+                let endRange = Self.firstRange(in: buffer, of: Self.closeTags)
                 if let range = endRange {
                     // Flush reasoning before the closing tag
                     reasoning += String(buffer[buffer.startIndex..<range.lowerBound])
                     buffer.removeSubrange(buffer.startIndex..<range.upperBound)
                     phase = .responding
-                } else if isSuffixOfTag(buffer, tags: ["</think>", "</thinking>", "<channel|>"]) {
+                } else if isSuffixOfTag(buffer, tags: Self.closeTags) {
                     // Partial closing tag — hold in buffer
                     return (reasoning, content)
                 } else {
@@ -1745,6 +3048,24 @@ struct ThinkingStateTracker {
             }
         }
         return (reasoning, content)
+    }
+
+    /// Drains any text still held in the buffer waiting on a partial tag that never
+    /// completed. Call once when generation ends, otherwise a response whose final
+    /// characters look like the start of a tag (e.g. a trailing "<") is silently
+    /// truncated (issue #108).
+    mutating func flush() -> (reasoning: String, content: String) {
+        defer { buffer = "" }
+        guard !buffer.isEmpty else { return ("", "") }
+        return phase == .thinking ? (buffer, "") : ("", buffer)
+    }
+
+    /// Earliest match of any tag, preferring the longest tag when several start at
+    /// the same offset (so `<thinking>` is not consumed as `<think>` + "ing>").
+    private static func firstRange(in s: String, of tags: [String]) -> Range<String.Index>? {
+        tags.compactMap { s.range(of: $0) }.min { a, b in
+            a.lowerBound == b.lowerBound ? a.upperBound > b.upperBound : a.lowerBound < b.lowerBound
+        }
     }
 
     private func isSuffixOfTag(_ s: String, tags: [String]) -> Bool {
@@ -1767,24 +3088,83 @@ actor PrefillState {
     private(set) var done: Bool = false
     private(set) var nPast: Int = 0
     func finish() { done = true }
-    func update(nPast: Int) { self.nPast = nPast }
+    // Updates arrive as detached Tasks and can land out of order.
+    func update(nPast: Int) { self.nPast = max(self.nPast, nPast) }
+}
+
+/// Routes `PrefillParameters.progress` into `activePrefillProgressHook`.
+/// Only the LLM `prepare` calls the hook directly; VLM `prepare` reports
+/// chunked prefill through `prefill.progress`, so without this the heartbeat's
+/// n_past stays 0 on the VLM path. The hook is read at call time, so the
+/// per-request hook installed by the streaming handlers is the one that fires.
+let forwardPrefillProgress: @Sendable (Int, Int) -> Void = { processed, total in
+    activePrefillProgressHook?(processed, total)
+}
+
+/// Emits an SSE comment every `interval` until the stream terminates or the task is
+/// cancelled.
+///
+/// Without it a stream can sit silent for minutes on slow hardware: through a long
+/// prefill (the progress heartbeat is opt-in) and while a tool call is buffered, since
+/// no delta is sent until it parses. Node/Bun clients abort a body idle for ~300 s
+/// (`terminated`), and the agent's retry re-pays the whole prefill. SSE parsers ignore
+/// comment lines, so this is safe for every client. Each yield is a complete event, so
+/// a comment can never land inside another event.
+func startSSEKeepalive(
+    _ cont: AsyncStream<String>.Continuation, interval: Duration = .seconds(5)
+) -> Task<Void, Never> {
+    Task {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: interval)
+            guard !Task.isCancelled else { return }
+            if case .terminated = cont.yield(": keepalive\r\n\r\n") { return }
+        }
+    }
+}
+
+/// What a JSON-mode stream sends for its buffered opening: the reply itself, unless a
+/// complete object precedes a second one; then the first is a hallucinated prefix and
+/// only the text from the second `{` on goes out. The earlier rule cut at the second `{`
+/// wherever it was, which turned `{"user": {"name": "Bob"}}` into `{"name": "Bob"}}`
+/// (#233). Braces are counted without regard to strings: this guards against a stray
+/// leading object, it is not a JSON parser.
+func jsonModeFlushText(_ buffered: String) -> String {
+    let trimmed = buffered.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.hasPrefix("{") else { return trimmed }
+    var depth = 0
+    for i in trimmed.indices {
+        switch trimmed[i] {
+        case "{": depth += 1
+        case "}": depth -= 1
+        default: continue
+        }
+        if depth == 0 {
+            let rest = trimmed[trimmed.index(after: i)...]
+            if let next = rest.firstIndex(of: "{") {
+                return String(trimmed[next...])
+            }
+            return trimmed
+        }
+    }
+    return trimmed
 }
 
 func handleChatStreaming(
-    stream: AsyncStream<Generation>,
+    startGeneration: @escaping () async throws -> (AsyncStream<Generation>, (() async -> Void)?),
     modelId: String,
     stopSequences: [String],
     includeUsage: Bool,
     promptTokenCount: Int,
     enableThinking: Bool = false,
+    thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
     logprobs: Bool = false,
-    semaphore: AsyncSemaphore,
+    tokenEcho: Bool = true,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
-    emitPrefillProgress: Bool,
-    onPrefillDone: (() async -> Void)? = nil
+    emitPrefillProgress: Bool
 ) -> Response {
     let (sseStream, cont) = AsyncStream<String>.makeStream()
 
@@ -1793,7 +3173,9 @@ func handleChatStreaming(
     // We capture the hook in a local variable so that concurrent requests
     // cannot clobber each other's hook via the global. The global is still
     // written here because LLMModel.prepare() reads it, but the semaphore
-    // ensures only one generation runs at a time.
+    // ensures only one generation runs at a time. Installed BEFORE the
+    // response is returned: startGeneration (prefill) runs inside the
+    // consumer task below, so the hook is live for the whole prefill.
     var heartbeatTask: Task<Void, Never>? = nil
     activePrefillProgressHook = nil
     if emitPrefillProgress {
@@ -1820,25 +3202,87 @@ func handleChatStreaming(
         }
     }
 
-    Task {
+    // First byte on the wire before any model work: proves connection
+    // liveness so a long prefill cannot trip the client's idle timeout
+    // (e.g. Bun fetch's 10s) into an ECONNRESET-and-retry loop.
+    cont.yield(": connected\r\n\r\n")
+    let keepaliveTask = startSSEKeepalive(cont)
+
+    let consumerTask: Task<Void, Never> = Task {
         var hasToolCalls = false
         var toolCallIndex = 0
         var completionTokenCount = 0
         var fullText = ""
         var stopped = false
         var firstToken = true
-        var tracker = ThinkingStateTracker()
-        // Unconditional cleanup: guarantees heartbeat is cancelled on ALL exit paths
-        // (normal completion, client disconnect, or task cancellation during prefill).
+        var tracker = ThinkingStateTracker(startInThinking: enableThinking && thinkingPreOpened)
+        // Raw characters handed to the thinking tracker — not necessarily characters on
+        // the wire, since the tracker may still be holding a partial tag — plus the tail
+        // withheld because it could still open a stop sequence. Counting consumption
+        // rather than chunk offsets is what makes the stop remainder correct regardless
+        // of where chunk boundaries fall. The count is in grapheme clusters, so the
+        // min() clamp at the stop path guards the rare case where a combining mark
+        // arriving in a later chunk merges with the previous one.
+        var emittedTextCount = 0
+        var heldStopTail = ""
+        let stopWindow = stopScanWindow(stopSequences)
+        // Characters appended since the last stop scan. Usually one chunk, but JSON-mode
+        // buffering skips the scan for its first chunks, so they must be covered later.
+        var unscannedStopChars = 0
+        // Unconditional cleanup: guarantees heartbeat is cancelled and the
+        // generation slot is returned on ALL exit paths (normal completion,
+        // startGeneration failure, client disconnect, or task cancellation).
         defer {
+            keepaliveTask.cancel()
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
+            slot.release()
         }
-        
+
+        // Start generation only now — the response headers are already on the
+        // wire, so even a multi-second prefill leaves an idle-timeout-free
+        // connection (heartbeat chunks flow if the client opted in).
+        let generation: (stream: AsyncStream<Generation>, onPrefillDone: (() async -> Void)?)
+        do {
+            generation = try await startGeneration()
+        } catch {
+            _ = cont.yield(sseErrorChunk(error))
+            _ = cont.yield("data: [DONE]\r\n\r\n")
+            cont.finish()
+            return
+        }
+        let stream = generation.stream
+        let onPrefillDone = generation.onPrefillDone
+
         // ── JSON mode streaming: buffer early tokens to strip hallucinated prefixes ──
         var jsonBuffering = jsonMode
         var jsonBuffer = ""
+        // Hands the buffered text to the client, once: at the flush threshold, or at the
+        // end of a stream that never reached it. The thresholds count chunks, and a reply
+        // that starts with `{` is held by the generator as a possible bare tool call until
+        // generation ends, so it usually arrives as one chunk; without the end-of-stream
+        // flush a JSON-mode stream carried no content at all (#233).
+        func flushJSONBuffer() {
+            guard jsonBuffering else { return }
+            jsonBuffering = false
+            let cleaned = jsonModeFlushText(jsonBuffer)
+            jsonBuffer = ""
+            let (rText, cText) = enableThinking ? tracker.process(cleaned) : ("", cleaned)
+            if !rText.isEmpty || !cText.isEmpty {
+                cont.yield(sseChunk(
+                    modelId: modelId,
+                    reasoningContent: rText.isEmpty ? nil : rText,
+                    content: cText.isEmpty ? nil : cText,
+                    finishReason: nil
+                ))
+            }
+            // Everything accumulated so far has now gone to the client, so
+            // the stop path must not re-emit it. Counting raw characters
+            // consumed (not the cleaned derivative that went on the wire)
+            // keeps this consistent with how the normal path counts.
+            emittedTextCount = fullText.count
+        }
 
         for await generation in stream {
             if stopped { break }
@@ -1846,6 +3290,7 @@ func handleChatStreaming(
             case .chunk(let text, _, let tokenLogprob):
                 completionTokenCount += 1
                 fullText += text
+                unscannedStopChars += text.count
                 // Per-token OpenAI logprobs entry (chosen-token logprob; producer-only, no alternatives).
                 // Token string reuses the streaming detokenizer output `text`; no Tokenizer is in scope here.
                 let logprobsEntry: [[String: Any]]? = logprobs
@@ -1875,8 +3320,10 @@ func handleChatStreaming(
                     if let onPrefillDone { await onPrefillDone() }
                     firstToken = false
                 }
-                print(text, terminator: "")
-                fflush(stdout)
+                if tokenEcho {
+                    print(text, terminator: "")
+                    fflush(stdout)
+                }
 
                 // ── JSON mode buffering: accumulate early tokens, strip prefix, then flush ──
                 if jsonBuffering {
@@ -1885,47 +3332,64 @@ func handleChatStreaming(
                     let enoughTokens = completionTokenCount >= 3
                     let hitMax = completionTokenCount >= 32
                     let hasDoubleBrace = enoughTokens && trimmed.hasPrefix("{") && trimmed.dropFirst().contains("{")
-
                     if hitMax || hasDoubleBrace {
-                        var cleaned = trimmed
-                        if hasDoubleBrace {
-                            if let firstBrace = cleaned.firstIndex(of: "{") {
-                                let afterFirst = cleaned.index(after: firstBrace)
-                                if let secondBrace = cleaned[afterFirst...].firstIndex(of: "{") {
-                                    cleaned = String(cleaned[secondBrace...])
-                                }
-                            }
-                        }
-                        let (rText, cText) = enableThinking ? tracker.process(cleaned) : ("", cleaned)
-                        if !rText.isEmpty || !cText.isEmpty {
-                            cont.yield(sseChunk(
-                                modelId: modelId,
-                                reasoningContent: rText.isEmpty ? nil : rText,
-                                content: cText.isEmpty ? nil : cText,
-                                finishReason: nil
-                            ))
-                        }
-                        jsonBuffering = false
+                        flushJSONBuffer()
                     }
                     continue  // skip normal emit while buffering or just flushed
                 }
 
+                // ── Stop sequence check BEFORE feeding the tracker ──
+                // The stop sequence itself must never reach the client, so only the
+                // slice of this chunk that survives the trim may enter the state
+                // machine. (An earlier revision fed the whole chunk first and emitted
+                // the tracker's output verbatim, which leaked the stop string and
+                // anything after it — review finding on #115. The pre-review code had
+                // the opposite bug: its arithmetic assumed everything before this chunk
+                // was already emitted, dropping text the tracker was holding.)
+                //
+                // A stop sequence can also straddle two chunks, in which case this chunk
+                // shows no match and its tail is the opening of one. Emitting that tail
+                // hands the client the very text it asked to be cut (#126), so the
+                // ambiguous suffix is withheld until the next chunk resolves it.
+                let stopHit = checkStopSequences(
+                    fullText, stopSequences: stopSequences, lookback: stopWindow + unscannedStopChars)
+                unscannedStopChars = 0
+                var survivingText: String
+                if let (trimmedFull, _) = stopHit {
+                    // The stop completed. Everything the client is owed is the part of
+                    // fullText before it, minus what has already gone out.
+                    survivingText = String(trimmedFull.dropFirst(min(emittedTextCount, trimmedFull.count)))
+                } else {
+                    let candidate = heldStopTail + text
+                    let holdLength = pendingStopPrefixLength(candidate, stopSequences: stopSequences)
+                    survivingText = String(candidate.dropLast(holdLength))
+                    heldStopTail = String(candidate.suffix(holdLength))
+                }
+                emittedTextCount += survivingText.count
+
                 // ── Route text through thinking state machine ──
                 let (reasoningText, contentText) = enableThinking
-                    ? tracker.process(text)
-                    : ("", text)
+                    ? tracker.process(survivingText)
+                    : ("", survivingText)
 
-                // ── Stop sequence check (operate on full accumulated text) ──
-                if let (trimmedFull, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
-                    // Emit any final partial content that hasn't been sent yet
-                    let emittedSoFar = fullText.count - text.count
-                    if trimmedFull.count > emittedSoFar {
-                        let partialText = String(trimmedFull.suffix(trimmedFull.count - emittedSoFar))
-                        let (r, c) = enableThinking ? tracker.process(partialText) : ("", partialText)
-                        cont.yield(sseChunk(modelId: modelId, reasoningContent: r.isEmpty ? nil : r,
-                                            content: c.isEmpty ? nil : c, finishReason: nil))
+                if stopHit != nil {
+                    if !reasoningText.isEmpty || !contentText.isEmpty {
+                        cont.yield(sseChunk(modelId: modelId,
+                                            reasoningContent: reasoningText.isEmpty ? nil : reasoningText,
+                                            content: contentText.isEmpty ? nil : contentText,
+                                            finishReason: nil))
+                    }
+                    // Drain anything still held for a partial tag that never completed.
+                    if enableThinking {
+                        let (r, c) = tracker.flush()
+                        if !r.isEmpty || !c.isEmpty {
+                            cont.yield(sseChunk(modelId: modelId, reasoningContent: r.isEmpty ? nil : r,
+                                                content: c.isEmpty ? nil : c, finishReason: nil))
+                        }
                     }
                     cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: "stop"))
+                    // Stopping here means `.info` never arrives, so usage is the chunk
+                    // count: a slight undercount if the decoder buffered any tokens.
                     let genDur = Date().timeIntervalSince(genStart)
                     let genTokPerSec = genDur > 0 ? Double(completionTokenCount) / genDur : 0
                     if includeUsage {
@@ -1956,7 +3420,18 @@ func handleChatStreaming(
                 cont.yield(sseToolCallChunk(modelId: modelId, index: toolCallIndex, name: tc.function.name, arguments: argsJson))
                 toolCallIndex += 1
 
+            case .rejectedToolCall(let rejection):
+                // `.rejectedToolCall` is new as of mlx-swift-lm 348ff97: a tool-call-shaped
+                // model output that failed parsing/authorization. There's no OpenAI wire
+                // shape for it, so it isn't forwarded to the client — just logged. Per
+                // `RejectedToolCall`'s doc comment, never log `rawTextPreview`; it may
+                // contain sensitive argument text.
+                print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
+
             case .info(let info):
+                // The chunk count undercounts: tokens the decoder buffers (tool-call
+                // bodies, partial text) emit no chunk. `info` carries the real count.
+                completionTokenCount = info.generationTokenCount
                 heartbeatTask?.cancel()
                 heartbeatTask = nil
                 activePrefillProgressHook = nil
@@ -1968,6 +3443,31 @@ func handleChatStreaming(
                         reason = "length"
                     case .cancelled, .stop:
                         reason = hasToolCalls ? "tool_calls" : "stop"
+                    }
+                    // A JSON-mode reply shorter than the flush threshold is still in the
+                    // buffer; it goes out before the finish chunk.
+                    flushJSONBuffer()
+                    // The withheld tail never became a stop sequence, so it is ordinary
+                    // output and must not be dropped.
+                    if !heldStopTail.isEmpty {
+                        let (r, c) = enableThinking
+                            ? tracker.process(heldStopTail) : ("", heldStopTail)
+                        heldStopTail = ""
+                        if !r.isEmpty || !c.isEmpty {
+                            cont.yield(sseChunk(modelId: modelId, reasoningContent: r.isEmpty ? nil : r,
+                                                content: c.isEmpty ? nil : c, finishReason: nil))
+                        }
+                    }
+                    // Drain text the tracker was holding on a partial tag that never
+                    // completed, otherwise the tail of the response is dropped (#108).
+                    if enableThinking {
+                        let (r, c) = tracker.flush()
+                        if !r.isEmpty || !c.isEmpty {
+                            cont.yield(sseChunk(modelId: modelId,
+                                                reasoningContent: r.isEmpty ? nil : r,
+                                                content: c.isEmpty ? nil : c,
+                                                finishReason: nil))
+                        }
                     }
                     cont.yield(sseChunk(modelId: modelId, reasoningContent: nil, content: nil, finishReason: reason))
                     let genDur = Date().timeIntervalSince(genStart)
@@ -2005,11 +3505,29 @@ func handleChatStreaming(
                 }
             }
         }
+        // Safety net: the tail is normally released in `case .info`, but a stream that
+        // ends without one — a generation error, or cancellation mid-decode — would
+        // otherwise discard up to maxStopLength-1 characters of real output, and in
+        // JSON mode the whole buffered reply.
+        if !stopped {
+            flushJSONBuffer()
+        }
+        if !stopped && !heldStopTail.isEmpty {
+            let (r, c) = enableThinking ? tracker.process(heldStopTail) : ("", heldStopTail)
+            heldStopTail = ""
+            if !r.isEmpty || !c.isEmpty {
+                cont.yield(sseChunk(modelId: modelId, reasoningContent: r.isEmpty ? nil : r,
+                                    content: c.isEmpty ? nil : c, finishReason: nil))
+            }
+        }
         cont.finish()
         let duration = Date().timeIntervalSince(genStart)
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-        await semaphore.signal()
     }
+    // If the client disconnects, Hummingbird tears down the response body,
+    // terminating sseStream — cancel the consumer so the generation loop stops
+    // and the defer above returns the slot instead of finishing a dead download.
+    cont.onTermination = { _ in consumerTask.cancel() }
     return Response(
         status: .ok,
         headers: sseHeaders(),
@@ -2025,9 +3543,11 @@ func handleChatNonStreaming(
     stopSequences: [String],
     promptTokenCount: Int,
     enableThinking: Bool = false,
+    thinkingPreOpened: Bool = false,
     jsonMode: Bool = false,
     logprobs: Bool = false,
-    semaphore: AsyncSemaphore,
+    tokenEcho: Bool = true,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     prefillStart: Date,
@@ -2039,9 +3559,9 @@ func handleChatNonStreaming(
     var tcIndex = 0
     var generationStopReason: GenerateStopReason = .stop
     var firstToken = true
-    // Accumulated per-token OpenAI logprobs entries (chosen-token logprob; producer-only).
     var logprobsEntries: [LogprobEntry] = []
-    for await generation in stream {
+    let stopWindow = stopScanWindow(stopSequences)
+    generationLoop: for await generation in stream {
         switch generation {
         case .chunk(let text, _, let tokenLogprob):
             fullText += text
@@ -2052,6 +3572,15 @@ func handleChatNonStreaming(
                     logprob: Double(tokenLogprob),
                     bytes: Array(text.utf8).map { Int($0) }
                 ))
+            }
+            // End generation at the first stop sequence, as the streaming path does. The
+            // text is trimmed below either way; continuing only spends compute and bills
+            // the client for tokens that are discarded. `.info` never arrives on this
+            // exit, so the count stays the chunk count.
+            if !stopSequences.isEmpty,
+               checkStopSequences(fullText, stopSequences: stopSequences, lookback: stopWindow + text.count) != nil
+            {
+                break generationLoop
             }
             // GPU yield: prevent Metal from starving macOS WindowServer
             if completionTokenCount % 8 == 0 {
@@ -2067,8 +3596,10 @@ func handleChatNonStreaming(
                 if let onPrefillDone { await onPrefillDone() }
                 firstToken = false
             }
-            print(text, terminator: "")
-            fflush(stdout)
+            if tokenEcho {
+                print(text, terminator: "")
+                fflush(stdout)
+            }
         case .toolCall(let tc):
             let argsJson = serializeToolCallArgs(tc.function.arguments)
             collectedToolCalls.append(ToolCallResponse(
@@ -2077,8 +3608,12 @@ func handleChatNonStreaming(
                 function: ToolCallFunction(name: tc.function.name, arguments: argsJson)
             ))
             tcIndex += 1
+        case .rejectedToolCall(let rejection):
+            // See the matching comment in `handleChatStreaming`: log only, no wire shape.
+            print("[SwiftLM] Rejected tool call: reason=\(rejection.reason) tool=\(rejection.toolName ?? "?") detail=\(rejection.detail ?? "n/a")")
         case .info(let info):
             generationStopReason = info.stopReason
+            completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
         }
     }
     print("")  // end the real-time token stream line
@@ -2086,7 +3621,7 @@ func handleChatNonStreaming(
     print("srv  slot done: id 0 | gen_tokens=\(completionTokenCount) | OS_RAM=\(String(format: "%.1f", postMemSnap.os))GB | MEM_DEMAND=\(String(format: "%.1f", postMemSnap.demand))GB | GPU_MEM=\(String(format: "%.1f", postMemSnap.gpu))GB")
     let duration = Date().timeIntervalSince(genStart)
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-    await semaphore.signal()
+    slot.release()
 
     // ── Apply stop sequences to final text ──
     var finishReason: String
@@ -2096,8 +3631,8 @@ func handleChatNonStreaming(
     default:
         finishReason = "stop"
     }
-    if checkStopSequences(fullText, stopSequences: stopSequences) != nil {
-        fullText = checkStopSequences(fullText, stopSequences: stopSequences)!.0
+    if let (trimmedText, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
+        fullText = trimmedText
         finishReason = "stop"
     }
 
@@ -2106,12 +3641,12 @@ func handleChatNonStreaming(
     var responseContent = fullText
     if enableThinking {
         print("srv debug: pre-extract fullText=\(fullText.prefix(40).debugDescription)")
-        let (extracted, remaining) = extractThinkingBlock(from: fullText)
+        let (extracted, remaining) = extractThinkingBlock(from: fullText, alreadyOpen: thinkingPreOpened)
         print("srv debug: extracted=\(extracted != nil ? "true" : "false"), remaining_len=\(remaining.count)")
-        if let extracted {
-            reasoningContent = extracted
-            responseContent = remaining
-        }
+        // `remaining` is already `fullText` when no tag was found, and it drops the closing
+        // tag when the reasoning was empty (`</think>` first, e.g. a zero thinking budget).
+        reasoningContent = extracted
+        responseContent = remaining
     }
 
     // ── JSON mode validation ──
@@ -2166,10 +3701,29 @@ func handleChatNonStreaming(
 }
 
 /// Returns (thinkingContent, remainingContent) or (nil, original) if no block found.
-func extractThinkingBlock(from text: String) -> (String?, String) {
+///
+/// - Parameter alreadyOpen: true when the chat template pre-opened the thinking block
+///   at the end of the prompt, so `text` starts *inside* the block with no opening tag
+///   of its own (issue #108). Everything up to the first closing tag is reasoning.
+func extractThinkingBlock(from text: String, alreadyOpen: Bool = false) -> (String?, String) {
     let startTag = text.range(of: "<thinking>") ?? text.range(of: "<think>") ?? text.range(of: "<|channel>thought\n") ?? text.range(of: "<|channel>thought") ?? (text.hasPrefix("thought\n") ? text.range(of: "thought\n") : nil)
     let endTag = text.range(of: "</thinking>") ?? text.range(of: "</think>") ?? text.range(of: "<channel|>")
-    
+
+    // Template pre-opened the block. Only a tag at the very start means the model
+    // re-emitted its own opening tag; a tag further in is the model *talking about* one
+    // from inside its reasoning, and deferring to the tag path there silently discarded
+    // everything before it. This matches the streaming tracker, which stays in the
+    // thinking phase until a closing tag.
+    if alreadyOpen, startTag.map({ $0.lowerBound != text.startIndex }) ?? true {
+        guard let endRange = endTag else {
+            // Still thinking when generation stopped — no response content yet.
+            return (text.isEmpty ? nil : text, "")
+        }
+        let thinking = String(text[text.startIndex..<endRange.lowerBound])
+        let remaining = String(text[endRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (thinking.isEmpty ? nil : thinking, remaining)
+    }
+
     guard let startRange = startTag, let endRange = endTag else {
         // If there's an unclosed thinking block (still thinking when stopped)
         if let startRange = startTag {
@@ -2193,7 +3747,12 @@ func handleTextCompletion(
     semaphore: AsyncSemaphore,
     stats: ServerStats
 ) async throws -> Response {
-    let compReq = try JSONDecoder().decode(TextCompletionRequest.self, from: bodyData)
+    let compReq: TextCompletionRequest
+    do {
+        compReq = try JSONDecoder().decode(TextCompletionRequest.self, from: bodyData)
+    } catch let error as DecodingError {
+        return invalidRequestResponse(error)
+    }
     let isStream = compReq.stream ?? false
     let emitPrefillProgress = prefillProgressEnabled(in: request)
 
@@ -2203,9 +3762,9 @@ func handleTextCompletion(
     let topK = compReq.topK ?? config.topK ?? 50
     let minP = compReq.minP.map(Float.init) ?? config.minP ?? 0.0
     let repeatPenalty = compReq.repetitionPenalty.map(Float.init) ?? config.repeatPenalty
-    let stopSequences = compReq.stop ?? []
+    let stopSequences = compReq.stop?.values ?? []
 
-    let params = GenerateParameters(
+    var generateParams = GenerateParameters(
         maxTokens: tokenLimit,
         maxKVSize: config.ctxSize,
         temperature: temperature,
@@ -2215,12 +3774,15 @@ func handleTextCompletion(
         repetitionPenalty: repeatPenalty,
         prefillStepSize: config.prefillSize
     )
-
-    if let seed = compReq.seed {
-        MLXRandom.seed(UInt64(seed))
-    }
+    generateParams.prefill.progress = forwardPrefillProgress
+    // Same seeding as the chat path; see the comment there (#219).
+    let seed = samplingSeed(compReq.seed)
+    generateParams.seed = seed
+    if let seed { MLXRandom.seed(seed) }
+    let params = generateParams
 
     await semaphore.wait()
+    let slot = GenerationSlot(semaphore: semaphore)
     await stats.requestStarted()
     let genStart = Date()
 
@@ -2229,20 +3791,29 @@ func handleTextCompletion(
 
     // ── Get actual prompt token count before generate() to avoid data race ──
     let promptTokenCount = lmInput.text.tokens.size
+    if let rejection = await rejectLongPrompt(
+        promptTokens: promptTokenCount, limit: config.maxPromptTokens, slot: slot, stats: stats)
+    {
+        return rejection
+    }
 
-    let stream = try await container.generate(input: lmInput, parameters: params)
     let modelId = config.modelId
 
     if isStream {
+        // Deferred: container.generate runs prefill; inside the consumer task it
+        // happens AFTER the response headers are on the wire (same rationale as
+        // the chat path — no silent-prefill idle timeout).
         return handleTextStreaming(
-            stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, semaphore: semaphore, stats: stats,
+            startGeneration: { try await container.generate(input: lmInput, parameters: params) },
+            modelId: modelId, stopSequences: stopSequences,
+            promptTokenCount: promptTokenCount, slot: slot, stats: stats,
             genStart: genStart, emitPrefillProgress: emitPrefillProgress
         )
     } else {
+        let stream = try await container.generate(input: lmInput, parameters: params)
         return try await handleTextNonStreaming(
             stream: stream, modelId: modelId, stopSequences: stopSequences,
-            promptTokenCount: promptTokenCount, semaphore: semaphore, stats: stats, genStart: genStart
+            promptTokenCount: promptTokenCount, slot: slot, stats: stats, genStart: genStart
         )
     }
 }
@@ -2250,11 +3821,11 @@ func handleTextCompletion(
 // ── Text Streaming ───────────────────────────────────────────────────────────
 
 func handleTextStreaming(
-    stream: AsyncStream<Generation>,
+    startGeneration: @escaping () async throws -> AsyncStream<Generation>,
     modelId: String,
     stopSequences: [String],
     promptTokenCount: Int,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date,
     emitPrefillProgress: Bool
@@ -2283,17 +3854,36 @@ func handleTextStreaming(
             }
         }
     }
-    Task {
+    // First byte before any model work — same liveness guarantee as the chat path.
+    cont.yield(": connected\r\n\r\n")
+    let keepaliveTask = startSSEKeepalive(cont)
+    let consumerTask: Task<Void, Never> = Task {
         var completionTokenCount = 0
         var fullText = ""
         var stopped = false
         var firstToken = true
-        // Unconditional cleanup: guarantees heartbeat is cancelled on ALL exit paths
-        // (normal completion, client disconnect, or task cancellation during prefill).
+        // Characters already sent, and the tail withheld because it could still open
+        // a stop sequence (#133). Local to this loop; the chat path has its own pair.
+        var emittedTextCount = 0
+        var heldStopTail = ""
+        let stopWindow = stopScanWindow(stopSequences)
+        // Unconditional cleanup: cancels the heartbeat and returns the generation
+        // slot on ALL exit paths (completion, startGeneration failure, disconnect).
         defer {
+            keepaliveTask.cancel()
             heartbeatTask?.cancel()
             heartbeatTask = nil
             activePrefillProgressHook = nil
+            slot.release()
+        }
+        let stream: AsyncStream<Generation>
+        do {
+            stream = try await startGeneration()
+        } catch {
+            _ = cont.yield(sseErrorChunk(error))
+            _ = cont.yield("data: [DONE]\n\n")
+            cont.finish()
+            return
         }
         for await generation in stream {
             if stopped { break }
@@ -2312,22 +3902,41 @@ func handleTextStreaming(
                 if completionTokenCount % 8 == 0 {
                     try? await Task.sleep(for: .microseconds(50))
                 }
-                if let (trimmedText, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
-                    let emittedSoFar = fullText.count - text.count
-                    if trimmedText.count > emittedSoFar {
-                        let partialText = String(trimmedText.suffix(trimmedText.count - emittedSoFar))
-                        cont.yield(sseTextChunk(modelId: modelId, text: partialText, finishReason: nil))
+                // Same treatment as the chat path (#126, #133): a stop sequence spanning
+                // two chunks shows no match on the first, and emitting that chunk hands
+                // the client the very text it asked to be cut. Withhold the ambiguous
+                // tail, and track characters actually released rather than deriving a
+                // position from chunk boundaries — that arithmetic was wrong in both
+                // directions on the chat path before it was replaced.
+                if let (trimmedText, _) = checkStopSequences(
+                    fullText, stopSequences: stopSequences, lookback: stopWindow + text.count
+                ) {
+                    let remainder = String(
+                        trimmedText.dropFirst(min(emittedTextCount, trimmedText.count)))
+                    if !remainder.isEmpty {
+                        cont.yield(sseTextChunk(modelId: modelId, text: remainder, finishReason: nil))
                     }
                     cont.yield(sseTextChunk(modelId: modelId, text: "", finishReason: "stop"))
                     cont.yield("data: [DONE]\n\n")
                     cont.finish()
                     stopped = true
                 } else {
-                    cont.yield(sseTextChunk(modelId: modelId, text: text, finishReason: nil))
+                    let candidate = heldStopTail + text
+                    let holdLength = pendingStopPrefixLength(candidate, stopSequences: stopSequences)
+                    let releasable = String(candidate.dropLast(holdLength))
+                    heldStopTail = String(candidate.suffix(holdLength))
+                    if !releasable.isEmpty {
+                        emittedTextCount += releasable.count
+                        cont.yield(sseTextChunk(modelId: modelId, text: releasable, finishReason: nil))
+                    }
                 }
-            case .toolCall:
+            case .toolCall, .rejectedToolCall:
+                // Text-completion endpoint: tool calling has no wire representation here.
                 break
             case .info(let info):
+                // The chunk count undercounts: tokens the decoder buffers (tool-call
+                // bodies, partial text) emit no chunk. `info` carries the real count.
+                completionTokenCount = info.generationTokenCount
                 heartbeatTask?.cancel()
                 heartbeatTask = nil
                 activePrefillProgressHook = nil
@@ -2340,17 +3949,27 @@ func handleTextStreaming(
                     case .cancelled, .stop:
                         reason = "stop"
                     }
+                    if !heldStopTail.isEmpty {
+                        cont.yield(sseTextChunk(modelId: modelId, text: heldStopTail, finishReason: nil))
+                        heldStopTail = ""
+                    }
                     cont.yield(sseTextChunk(modelId: modelId, text: "", finishReason: reason))
                     cont.yield("data: [DONE]\n\n")
                     cont.finish()
                 }
             }
         }
+        // The tail never became a stop sequence, so it is ordinary output. Normally
+        // released above; this covers a stream that ends without an .info event.
+        if !stopped && !heldStopTail.isEmpty {
+            cont.yield(sseTextChunk(modelId: modelId, text: heldStopTail, finishReason: nil))
+            heldStopTail = ""
+        }
         cont.finish()
         let duration = Date().timeIntervalSince(genStart)
         await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-        await semaphore.signal()
     }
+    cont.onTermination = { _ in consumerTask.cancel() }
     return Response(
         status: .ok,
         headers: sseHeaders(),
@@ -2365,30 +3984,51 @@ func handleTextNonStreaming(
     modelId: String,
     stopSequences: [String],
     promptTokenCount: Int,
-    semaphore: AsyncSemaphore,
+    slot: GenerationSlot,
     stats: ServerStats,
     genStart: Date
 ) async throws -> Response {
     var fullText = ""
     var completionTokenCount = 0
-    for await generation in stream {
+    var generationStopReason: GenerateStopReason = .stop
+    let stopWindow = stopScanWindow(stopSequences)
+    generationLoop: for await generation in stream {
         switch generation {
         case .chunk(let text, _, _):
             fullText += text
             completionTokenCount += 1
+            // See handleChatNonStreaming: stop generating at the first stop sequence.
+            if !stopSequences.isEmpty,
+               checkStopSequences(fullText, stopSequences: stopSequences, lookback: stopWindow + text.count) != nil
+            {
+                break generationLoop
+            }
             // GPU yield: prevent Metal from starving macOS WindowServer
             if completionTokenCount % 8 == 0 {
                 try? await Task.sleep(for: .microseconds(50))
             }
-        case .toolCall, .info:
+        case .info(let info):
+            generationStopReason = info.stopReason
+            completionTokenCount = info.generationTokenCount  // real count; see handleChatStreaming
+        case .toolCall, .rejectedToolCall:
             break
         }
     }
     let duration = Date().timeIntervalSince(genStart)
     await stats.requestFinished(tokens: completionTokenCount, duration: duration)
-    await semaphore.signal()
+    slot.release()
 
-    var finishReason = "stop"
+    // Same mapping as handleChatNonStreaming (#227). This path used to hardcode "stop",
+    // so a completion cut off by max_tokens was reported as a natural end; the
+    // streaming text path and both chat paths already said "length". A stop sequence
+    // still wins below, whatever ended generation.
+    var finishReason: String
+    switch generationStopReason {
+    case .length:
+        finishReason = "length"
+    default:
+        finishReason = "stop"
+    }
     if let (trimmedText, _) = checkStopSequences(fullText, stopSequences: stopSequences) {
         fullText = trimmedText
         finishReason = "stop"
@@ -2447,6 +4087,41 @@ actor AsyncSemaphore {
             let waiter = waiters.removeFirst()
             waiter.resume()
         }
+    }
+}
+
+/// Holds one slot acquired from ``AsyncSemaphore`` and guarantees it is
+/// released exactly once — whichever of an explicit `release()` or `deinit`
+/// fires first.
+///
+/// Without this, any `throw` after `semaphore.wait()` (e.g. `container.prepare`
+/// or `container.perform` failing) skipped every `signal()` call site and
+/// permanently leaked the slot; with the default `--parallel 1` a single failed
+/// request wedged the server for all subsequent generations until restart.
+final class GenerationSlot: @unchecked Sendable {
+    private let semaphore: AsyncSemaphore
+    private let lock = NSLock()
+    private var released = false
+
+    init(semaphore: AsyncSemaphore) {
+        self.semaphore = semaphore
+    }
+
+    func release() {
+        lock.lock()
+        let first = !released
+        released = true
+        lock.unlock()
+        guard first else { return }
+        // Bind locally: a closure that touches `self.semaphore` would capture
+        // `self`, which the runtime rejects (dangling ref) when this is called
+        // from `deinit`.
+        let sem = semaphore
+        Task { await sem.signal() }
+    }
+
+    deinit {
+        release()
     }
 }
 
@@ -2519,14 +4194,96 @@ struct ApiKeyMiddleware<Context: RequestContext>: RouterMiddleware {
 
 // ── Stop Sequence Detection ──────────────────────────────────────────────────
 
-func checkStopSequences(_ text: String, stopSequences: [String]) -> (String, String)? {
-    for stop in stopSequences {
-        if let range = text.range(of: stop) {
-            let trimmed = String(text[text.startIndex..<range.lowerBound])
-            return (trimmed, stop)
+/// How many trailing characters of `text` must be withheld because they could still turn
+/// out to be the opening of a stop sequence.
+///
+/// The stop check only ever fires on the chunk that *completes* a stop sequence, so a
+/// stop split across two chunks had its first part streamed before the match was visible:
+/// `stop: ["\nUser:"]` arriving as `"\nUser"` then `":"` sent `"\nUser"` to the client —
+/// the exact text the client asked to be cut (#126). Withholding the ambiguous tail until
+/// the next chunk resolves it closes that window, at the cost of one chunk of latency on
+/// the tail. This mirrors ThinkingStateTracker's partial-tag handling.
+///
+/// Returns 0 when nothing is ambiguous, so the common case emits immediately.
+func pendingStopPrefixLength(_ text: String, stopSequences: [String]) -> Int {
+    var longest = 0
+    for stop in stopSequences where !stop.isEmpty {
+        // Only *proper* prefixes matter: a complete match is the stop check's job.
+        let maxLength = min(text.count, stop.count - 1)
+        guard maxLength > 0 else { continue }
+        for length in stride(from: maxLength, through: 1, by: -1) where length > longest {
+            if text.hasSuffix(String(stop.prefix(length))) {
+                longest = length
+                break
+            }
         }
     }
-    return nil
+    return longest
+}
+
+/// The context `generateMTP` should run against, and whether MTP applies at all.
+///
+/// Two shapes exist. Qwen3.5 and DeepSeek V4 carry MTP heads inside the main checkpoint,
+/// so the main context is already an `MTPLanguageModel` and is used as-is. Gemma 4 ships
+/// the heads as a separate assistant checkpoint: there the *assistant* is the
+/// `MTPLanguageModel`, so it is swapped into a derived context while the tokenizer,
+/// processor and configuration — and the KV cache passed alongside — stay the trunk's.
+/// That mirrors the reference usage in Gemma4MTPBench, which passes the assistant as the
+/// model and the main model's cache.
+///
+/// Returns nil when MTP does not apply, so callers fall through to plain generation.
+func mtpContext(main: ModelContext, assistant: (any DualModelMTP)?) -> ModelContext? {
+    if let assistant, let assistantModel = assistant as? (any LanguageModel) {
+        return ModelContext(
+            configuration: main.configuration,
+            model: assistantModel,
+            processor: main.processor,
+            tokenizer: main.tokenizer
+        )
+    }
+    return main.model is any MTPLanguageModel ? main : nil
+}
+
+/// Trims `text` at the earliest stop sequence it contains.
+///
+/// Earliest *in the text*, not first in the caller's list: returning whichever entry
+/// happened to be listed first kept everything between the real stop and that one, so
+/// `stop: ["\nUser:", "X"]` against `"abXc\nUser:"` streamed `"abXc"` when the client
+/// had asked to stop at `X` (#126).
+///
+/// `lookback` limits the search to the last `lookback` characters. Streaming callers
+/// pass the length of text appended since their last scan plus `stopScanWindow(_:)`:
+/// everything before it was already checked without a match, so a new match must end
+/// inside the new text.
+/// Without it, re-scanning the whole response on every chunk is O(n²). `nil` scans all.
+func checkStopSequences(_ text: String, stopSequences: [String], lookback: Int? = nil) -> (String, String)? {
+    let searchStart = lookback.flatMap {
+        text.index(text.endIndex, offsetBy: -$0, limitedBy: text.startIndex)
+    } ?? text.startIndex
+    let searched = text[searchStart...]
+    var earliest: (index: String.Index, stop: String)?
+    for stop in stopSequences where !stop.isEmpty {
+        guard let range = searched.range(of: stop) else { continue }
+        if earliest == nil || range.lowerBound < earliest!.index {
+            earliest = (range.lowerBound, stop)
+        }
+    }
+    guard let earliest else { return nil }
+    return (String(text[text.startIndex..<earliest.index]), earliest.stop)
+}
+
+/// The sampler seed for a request `seed`. OpenAI's `seed` is a plain integer, so negative
+/// values do arrive, and `UInt64(seed)` trapped on them — one such request took the whole
+/// server down (#219). Taking the bit pattern keeps every distinct Int a distinct seed.
+func samplingSeed(_ requested: Int?) -> UInt64? {
+    requested.map { UInt64(bitPattern: Int64($0)) }
+}
+
+/// Characters of already-checked text a streaming stop scan must look back over: the
+/// longest stop string, plus one because a chunk can merge with the previous character
+/// into a single grapheme.
+func stopScanWindow(_ stopSequences: [String]) -> Int {
+    (stopSequences.map(\.count).max() ?? 0) + 1
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2557,6 +4314,128 @@ func sseHeaders() -> HTTPFields {
         HTTPField(name: .cacheControl, value: "no-cache"),
         HTTPField(name: HTTPField.Name("X-Accel-Buffering")!, value: "no"),
     ])
+}
+
+/// OpenAI-shaped `context_length_exceeded` body when `promptTokens` is over the
+/// `--max-prompt-tokens` limit, else nil (always nil when no limit is set).
+///
+/// It uses OpenAI's wording and code so agent clients recognise it and compact
+/// their history instead of retrying the same prompt.
+func promptTooLongBody(promptTokens: Int, limit: Int?) -> String? {
+    guard let limit, promptTokens > limit else { return nil }
+    return "{\"error\":{\"message\":\"This model's maximum context length is \(limit) tokens. However, your messages resulted in \(promptTokens) tokens.\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}"
+}
+
+/// Components that cap reasoning at `budget` tokens, or nil when no cap applies (no budget,
+/// thinking off, or a model that declares no reasoning protocol). Throws `ThinkingBudgetError`
+/// for a budget the request cannot honour, e.g. a `max_tokens` too small for the budget plus
+/// the answer.
+///
+/// The transition is `.immediate`: the model's own `</think>` closes the span with no extra
+/// text. Qwen3.5 declares no validated hard-budget transition, so this is an opt-in.
+func thinkingBudgetComponents(
+    budget: Int?, enableThinking: Bool, reasoning: ReasoningConfig?,
+    tokenizer: any MLXLMCommon.Tokenizer, parameters: GenerateParameters
+) throws -> GenerationComponents? {
+    guard let budget, enableThinking, let reasoning else { return nil }
+    let configuration = try ThinkingBudgetConfiguration(
+        maximumTokenCount: budget, transitionOverride: .immediate)
+    let components = try GenerationComponents().applyingThinkingBudget(
+        configuration, reasoning: reasoning, tokenizer: tokenizer)
+    try components.validate(parameters: parameters)
+    return components
+}
+
+/// OpenAI-shaped 400 body for a reasoning budget the request cannot honour.
+func thinkingBudgetErrorBody(_ error: ThinkingBudgetError) -> String {
+    let payload: [String: Any] = ["error": [
+        "message": error.errorDescription ?? "Invalid thinking budget.",
+        "type": "invalid_request_error",
+        "code": "invalid_thinking_budget",
+    ]]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        return "{\"error\":{\"message\":\"Invalid thinking budget.\",\"type\":\"invalid_request_error\",\"code\":\"invalid_thinking_budget\"}}"
+    }
+    return json
+}
+
+/// Releases the slot and returns a 400 when the prompt is over `--max-prompt-tokens`,
+/// else nil. Runs before prefill, so a rejected prompt costs no GPU work.
+func rejectLongPrompt(promptTokens: Int, limit: Int?, slot: GenerationSlot, stats: ServerStats) async -> Response? {
+    guard let limit, let body = promptTooLongBody(promptTokens: promptTokens, limit: limit) else { return nil }
+    print("srv  slot_reject: id 0 | prompt=\(promptTokens)t exceeds max_prompt_tokens=\(limit)")
+    slot.release()
+    await stats.requestFinished(tokens: 0, duration: 0)
+    return Response(status: .badRequest, headers: jsonHeaders(), body: .init(byteBuffer: ByteBuffer(string: body)))
+}
+
+/// The 400 for a request body that does not decode. OpenAI answers these with
+/// `invalid_request_error` and names the offending `param`; the OpenAI SDKs treat a 400
+/// as final but retry a 5xx, so answering a decode failure with 500 `server_error` cost
+/// every malformed request three attempts and told the client the server was at fault.
+func invalidRequestResponse(_ error: DecodingError) -> Response {
+    Response(
+        status: .badRequest,
+        headers: jsonHeaders(),
+        body: .init(byteBuffer: ByteBuffer(string: invalidRequestJSON(error)))
+    )
+}
+
+func invalidRequestJSON(_ error: DecodingError) -> String {
+    func dotted(_ path: [CodingKey]) -> String {
+        path.map { $0.intValue.map(String.init) ?? $0.stringValue }.joined(separator: ".")
+    }
+    let message: String
+    let path: [CodingKey]
+    switch error {
+    case .keyNotFound(let key, let context):
+        path = context.codingPath + [key]
+        message = "Missing required parameter: '\(dotted(path))'."
+    case .typeMismatch(_, let context):
+        path = context.codingPath
+        message = "Invalid type for '\(dotted(path))': \(context.debugDescription)"
+    case .valueNotFound(_, let context):
+        path = context.codingPath
+        message = "Missing value for '\(dotted(path))'."
+    case .dataCorrupted(let context):
+        path = context.codingPath
+        message = context.debugDescription
+    @unknown default:
+        path = []
+        message = String(describing: error)
+    }
+    var payload: [String: Any] = ["message": message, "type": "invalid_request_error"]
+    if !path.isEmpty { payload["param"] = dotted(path) }
+    guard let data = try? JSONSerialization.data(withJSONObject: ["error": payload]),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        return "{\"error\":{\"message\":\"invalid request\",\"type\":\"invalid_request_error\"}}"
+    }
+    return json
+}
+
+/// Build an OpenAI-style `{"error":{...}}` body for a server error. The message
+/// is JSON-encoded, so quotes, backslashes and newlines in it stay valid JSON.
+func errorJSON(_ error: Error) -> String {
+    let payload: [String: Any] = ["error": [
+        "message": String(describing: error),
+        "type": "server_error",
+        "code": "internal_error",
+    ]]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8)
+    else {
+        return "{\"error\":{\"message\":\"internal error\",\"type\":\"server_error\",\"code\":\"internal_error\"}}"
+    }
+    return json
+}
+
+/// Build an OpenAI-style SSE `error` event for a failure after the stream's
+/// headers are already sent (the client sees HTTP 200).
+func sseErrorChunk(_ error: Error) -> String {
+    "data: \(errorJSON(error))\r\n\r\n"
 }
 
 /// Build a chat.completion.chunk SSE event.
@@ -2598,8 +4477,7 @@ func sseChunk(modelId: String, reasoningContent: String?, content: String?, fini
 
 /// Prefill-progress heartbeat chunk — emitted every 2s while the server is processing the prompt
 /// when explicitly enabled via `X-SwiftLM-Prefill-Progress: true`.
-/// It is sent as a named SSE event (`event: prefill_progress`) to avoid breaking strict
-/// OpenAI-compatible clients (e.g. OpenCode), which reject unknown `data:` objects.
+/// It is sent as a named SSE event (`event: prefill_progress`).
 /// Format mirrors llama-server's slot_update event:
 ///   n_past          : tokens evaluated so far (real value from chunked prefill, or 0 for single-chunk)
 ///   n_prompt_tokens : total prompt token count
@@ -2607,6 +4485,9 @@ func sseChunk(modelId: String, reasoningContent: String?, content: String?, fini
 ///   elapsed_seconds : wall-clock time since the request started
 /// Note: `model` is intentionally omitted — clients can correlate from preceding stream chunks.
 /// Note: `on` is accepted as a truthy header value for parity with common reverse proxy conventions.
+/// Issue #168: `choices: []` is present so strict OpenAI chunk validators (opencode's
+/// ChatCompletionChunk union) accept the payload even when they parse every `data:` line
+/// regardless of `event:`. The named event alone was not enough.
 func ssePrefillChunk(nPast: Int = 0, promptTokens: Int, elapsedSeconds: Int) -> String {
     let fraction = promptTokens > 0 ? Double(nPast) / Double(promptTokens) : 0.0
     let chunk: [String: Any] = [
@@ -2614,7 +4495,8 @@ func ssePrefillChunk(nPast: Int = 0, promptTokens: Int, elapsedSeconds: Int) -> 
         "n_past": nPast,
         "n_prompt_tokens": promptTokens,
         "fraction": fraction,
-        "elapsed_seconds": elapsedSeconds
+        "elapsed_seconds": elapsedSeconds,
+        "choices": [Any]()
     ]
     let data = try! JSONSerialization.data(withJSONObject: chunk)
     return "event: prefill_progress\r\ndata: \(String(data: data, encoding: .utf8)!)\r\n\r\n"
@@ -2781,6 +4663,48 @@ struct ChatCompletionRequest: Decodable {
                 return nil
             }
         }
+
+        /// Convert OpenAI JSON spec message to internal Chat.Message
+        func toChatMessage() -> Chat.Message {
+            let text = textContent
+            let imgs = extractImages()
+            let aud = extractAudio()
+
+            switch role {
+            case "system", "developer":
+                return .system(text, images: imgs, audios: aud)
+            case "assistant":
+                // `Chat.Message.assistant(...)` takes `[ToolCall]?` as of
+                // mlx-swift-lm 348ff97 (previously a raw `[[String: any Sendable]]?`
+                // dictionary array), and no longer accepts `audios:` — assistant
+                // messages don't carry input audio.
+                var formattedToolCalls: [ToolCall]? = nil
+                if let tc = tool_calls, !tc.isEmpty {
+                    formattedToolCalls = tc.map { call in
+                        // `call.function.arguments` is the raw JSON-string form (as sent
+                        // by an OpenAI-style client); `ToolCall.Function` wants it decoded
+                        // into `[String: JSONValue]`. Fall back to an empty dict if it
+                        // isn't valid JSON rather than dropping the whole tool call.
+                        let argsDict: [String: JSONValue]
+                        if let data = call.function.arguments.data(using: .utf8),
+                            let decoded = try? JSONDecoder().decode([String: JSONValue].self, from: data)
+                        {
+                            argsDict = decoded
+                        } else {
+                            argsDict = [:]
+                        }
+                        return ToolCall(
+                            function: .init(name: call.function.name, arguments: argsDict),
+                            id: call.id)
+                    }
+                }
+                return .assistant(text, images: imgs, toolCalls: formattedToolCalls)
+            case "tool":
+                return .tool(text, id: tool_call_id)
+            default:
+                return .user(text, images: imgs, audios: aud)
+            }
+        }
     }
 
     /// Message content: either a plain string or structured multipart content
@@ -2836,6 +4760,10 @@ struct ChatCompletionRequest: Decodable {
     let messages: [Message]
     let stream: Bool?
     let maxTokens: Int?
+    /// OpenAI's current name for `max_tokens` (which it deprecated). Clients that send
+    /// only this, e.g. pi for any provider it does not recognise, were silently capped
+    /// at the server's `--max-tokens` instead.
+    let maxCompletionTokens: Int?
     let temperature: Double?
     let topP: Double?
     let topK: Int?
@@ -2844,12 +4772,14 @@ struct ChatCompletionRequest: Decodable {
     let frequencyPenalty: Double?
     let presencePenalty: Double?
     let tools: [ToolDef]?
-    let stop: [String]?
+    let stop: StopSequences?
     let seed: Int?
     let streamOptions: StreamOptions?
     let responseFormat: ResponseFormat?
     /// Per-request Jinja template kwargs (e.g. {"enable_thinking": false} for Qwen3/Qwen3.5)
     let chatTemplateKwargs: [String: Bool]?
+    /// Per-request reasoning-token cap; overrides `--thinking-budget`.
+    let thinkingBudget: Int?
     /// Top-level thinking override emitted by Aegis-AI gateway
     let enableThinking: Bool?
     /// OpenAI logprobs: when true, emit chosen-token log-probabilities in the response.
@@ -2864,6 +4794,7 @@ struct ChatCompletionRequest: Decodable {
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature, tools, stop, seed
         case maxTokens = "max_tokens"
+        case maxCompletionTokens = "max_completion_tokens"
         case topP = "top_p"
         case topK = "top_k"
         case minP = "min_p"
@@ -2876,7 +4807,23 @@ struct ChatCompletionRequest: Decodable {
         case enableThinking = "enable_thinking"
         case logprobs
         case topLogprobs = "top_logprobs"
+        case thinkingBudget = "thinking_budget"
         case kvBits = "kv_bits"
+    }
+}
+
+/// OpenAI's `stop` is "string / array / null": a single sequence may be sent bare, and
+/// several clients do. Decoding only the array form answered those requests with a 500.
+struct StopSequences: Decodable {
+    let values: [String]
+
+    init(from decoder: Swift.Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let single = try? container.decode(String.self) {
+            values = [single]
+        } else {
+            values = try container.decode([String].self)
+        }
     }
 }
 
@@ -2890,7 +4837,7 @@ struct TextCompletionRequest: Decodable {
     let topK: Int?
     let minP: Double?
     let repetitionPenalty: Double?
-    let stop: [String]?
+    let stop: StopSequences?
     let seed: Int?
 
     enum CodingKeys: String, CodingKey {
@@ -3097,7 +5044,7 @@ public struct ALMUserInputProcessor: UserInputProcessor, @unchecked Sendable {
                 messages: messages, tools: input.tools, additionalContext: input.additionalContext)
             
             // Check if there is audio to interleave
-            if !input.audio.isEmpty {
+            if !input.audios.isEmpty {
                 print("[ALM] Interleaving Audio Tokens into prompt.")
                 // Mock num audio embeddings for now - typically derived from the model or audio lengths
                 let rawSequence = fusionProcessor.interleave(
@@ -3117,7 +5064,15 @@ public struct ALMUserInputProcessor: UserInputProcessor, @unchecked Sendable {
     }
 }
 
-public final class ALMModelFactory: ModelFactory, @unchecked Sendable {
+// `class X: ModelFactory` (the constrained `GenericModelFactory<ModelContext,
+// ModelContainer>` typealias) is no longer a legal inheritance clause as of
+// mlx-swift-lm 348ff97 — a class can't inherit from a protocol type that
+// supplies primary associated-type arguments. Upstream's own factories
+// (`LLMModelFactory`, `VLMModelFactory`) switched to conforming to the
+// unconstrained `GenericModelFactory` protocol directly, letting `ContextType`/
+// `ContainerType` be inferred as `ModelContext`/`ModelContainer` from the
+// `_load`/`_wrap` implementations below; do the same here.
+public final class ALMModelFactory: GenericModelFactory, @unchecked Sendable {
     public static let shared = ALMModelFactory()
     public let typeRegistry: ModelTypeRegistry = LLMTypeRegistry.shared
     public let modelRegistry: AbstractModelRegistry = LLMRegistry.shared
@@ -3172,7 +5127,7 @@ public struct OmniUserInputProcessor: UserInputProcessor, @unchecked Sendable {
             return vlmInput
         }
         
-        if !input.audio.isEmpty && !tokens.isEmpty {
+        if !input.audios.isEmpty && !tokens.isEmpty {
             print("[Omni] Interleaving Audio Tokens into VLM prompt structure.")
             let rawSequence = fusionProcessor.interleave(
                 textTokens: tokens,
@@ -3186,7 +5141,9 @@ public struct OmniUserInputProcessor: UserInputProcessor, @unchecked Sendable {
     }
 }
 
-public final class OmniModelFactory: ModelFactory, @unchecked Sendable {
+// See the comment on `ALMModelFactory` above: conform to the unconstrained
+// `GenericModelFactory` protocol, not the constrained `ModelFactory` typealias.
+public final class OmniModelFactory: GenericModelFactory, @unchecked Sendable {
     public static let shared = OmniModelFactory()
     public let typeRegistry: ModelTypeRegistry = VLMTypeRegistry.shared
     public let modelRegistry: AbstractModelRegistry = VLMRegistry.shared

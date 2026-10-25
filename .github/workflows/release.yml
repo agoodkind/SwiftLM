@@ -1,6 +1,20 @@
 name: Release
 
-# Auto-release on every push to main (like llama.cpp)
+# Auto-release after CI passes on main.
+#
+# This used to trigger directly on push, which meant the release built and published
+# concurrently with CI Pipeline and did not depend on it — a red pipeline still shipped a
+# binary. workflow_run defers the release until CI Pipeline has concluded, and the job
+# guard below requires that conclusion to be success.
+#
+# To be clear about what this does not fix: b674 shipped a Gemma 4 regression while CI
+# was green on that commit, because no job loads gemma-4-e2b-it-4bit. Gating stops a
+# release when CI fails; it cannot stop one when CI passes on an untested path.
+#
+# The opencode job is no longer continue-on-error, so a failure there now flips CI
+# Pipeline to failure and stops the release. That coupling is intentional: the job tests
+# the request shape opencode sends rather than shelling out to its npm CLI, so a failure
+# means SwiftLM misbehaved.
 on:
   workflow_dispatch:
     inputs:
@@ -8,21 +22,11 @@ on:
         description: 'Create new release'
         required: true
         type: boolean
-  push:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
     branches:
       - main
-    paths:
-      - '**/*.swift'
-      - '**/*.c'
-      - '**/*.cpp'
-      - '**/*.h'
-      - '**/*.hpp'
-      - '**/*.m'
-      - '**/*.mm'
-      - '**/*.metal'
-      - 'Package.swift'
-      - 'Package.resolved'
-      - '.github/workflows/release.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -34,15 +38,48 @@ permissions:
 jobs:
   build-and-release:
     runs-on: macos-15
+    # A manual dispatch always runs; an automatic one only after CI succeeded.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Full history for build number
           submodules: recursive
+          # Build exactly the commit CI validated. workflow_run would otherwise check out
+          # the branch tip, which may already have moved on to an untested commit.
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      # mlx-swift-lm needs Swift tools 6.2; the macos-15 default Xcode ships 6.1.
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
+
+      # workflow_run carries no path filter, so the old `paths:` list is enforced here.
+      # Without this a docs-only commit would publish a release, because CI runs on every
+      # push to main. Submodule pointer moves count as source: the mlx-swift-lm bump is
+      # how the Gemma 4 fix reached users.
+      - name: Check for source changes since the last release
+        id: changes
+        run: |
+          LAST_TAG="$(git tag --list 'b[0-9]*' --sort=-creatordate | head -1)"
+          if [ -z "$LAST_TAG" ]; then
+            echo "No previous release tag; treating as source change."
+            echo "source=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          CHANGED="$(git diff --name-only "$LAST_TAG"..HEAD || true)"
+          echo "Changed since $LAST_TAG:"; echo "$CHANGED" | head -40
+          if echo "$CHANGED" | grep -qE '\.(swift|c|cpp|h|hpp|m|mm|metal)$|^Package\.(swift|resolved)$|^\.github/workflows/release\.yml$|^mlx-swift(-lm)?$'; then
+            echo "source=true" >> $GITHUB_OUTPUT
+          else
+            echo "No source changes since $LAST_TAG — build will run, publish will be skipped."
+            echo "source=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Determine tag name
         id: tag
@@ -107,6 +144,17 @@ jobs:
           
       - name: Build macOS DMG Wrapper
         run: |
+          # Previously hardcoded 1.0/1 inside generate_xcodeproj.py, so every
+          # release ever built reported the same app version regardless of
+          # which commit produced it. SWIFTBUDDY_BUILD_NUMBER reuses the same
+          # `git rev-list --count HEAD` counter this workflow's bNNN release
+          # tags already use (step "Determine tag name" above), so the app's
+          # build number and its release tag always agree. Marketing version
+          # is date-based (always distinct, no manual "when do we bump this"
+          # decision needed for a pipeline that releases roughly daily).
+          export SWIFTBUDDY_MARKETING_VERSION="$(date -u +%Y.%m.%d)"
+          export SWIFTBUDDY_BUILD_NUMBER="$(git rev-list --count HEAD)"
+          echo "App version: ${SWIFTBUDDY_MARKETING_VERSION} (${SWIFTBUDDY_BUILD_NUMBER})"
           cd SwiftBuddy && python3 generate_xcodeproj.py
           cd ..
           xcodebuild clean build \
@@ -114,6 +162,7 @@ jobs:
             -scheme SwiftBuddy \
             -destination "generic/platform=macOS" \
             -configuration Release \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_ENTITLEMENTS="" \
@@ -153,7 +202,7 @@ jobs:
           ### Download
 
           - **CLI Server**: [macOS Apple Silicon (arm64)](https://github.com/SharpAI/SwiftLM/releases/download/${{ steps.tag.outputs.name }}/SwiftLM-${{ steps.tag.outputs.name }}-macos-arm64.tar.gz)
-          - **GUI Desktop App**: Download the attached `SwiftBuddy-macOS.dmg` below!
+          - **GUI Desktop App**: Download the attached DMG file below!
 
           ### Quick Start
           
@@ -168,7 +217,9 @@ jobs:
           RELEASE_EOF
 
       - name: Create release
-        if: ${{ github.event_name == 'push' || github.event.inputs.create_release == 'true' }}
+        if: >-
+          ${{ (github.event_name == 'workflow_run' && steps.changes.outputs.source == 'true')
+          || github.event.inputs.create_release == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}

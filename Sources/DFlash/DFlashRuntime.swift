@@ -149,8 +149,11 @@ public enum DFlashRuntime {
     ///   - dflashUseTapeRollback=false → MambaSnapshotCache (snapshot-only, O(1) overhead)
     public static func makeTargetCache(
         targetModel: any DFlashTargetModel
-    ) -> [KVCache] {
-        var cache = targetModel.newCache(parameters: nil)
+    ) throws -> [KVCache] {
+        // `LanguageModel.newCache(parameters:)` is `throws` as of mlx-swift-lm
+        // commit 348ff97; propagate rather than swallow since a model's cache
+        // construction can legitimately fail (e.g. unsupported cache config).
+        var cache = try targetModel.newCache(parameters: nil)
         if targetModel.dflashIsHybridGDN {
             for i in 0 ..< cache.count {
                 if cache[i] is MambaCache {
@@ -252,21 +255,33 @@ public enum DFlashRuntime {
         // via a Continuation, avoiding the buffered-array bottleneck.
         AsyncStream(bufferingPolicy: .unbounded) { continuation in
             let task = Task {
-                generateStreaming(
-                    targetModel: targetModel,
-                    draftModel: draftModel,
-                    promptTokens: promptTokens,
-                    maxNewTokens: maxNewTokens,
-                    blockTokens: blockTokens,
-                    stopTokenIDs: stopTokenIDs,
-                    suppressTokenIDs: suppressTokenIDs,
-                    draftSinkSize: draftSinkSize,
-                    draftWindowSize: draftWindowSize,
-                    yield: { event in
-                        guard !Task.isCancelled else { return }
-                        continuation.yield(event)
-                    }
-                )
+                do {
+                    try generateStreaming(
+                        targetModel: targetModel,
+                        draftModel: draftModel,
+                        promptTokens: promptTokens,
+                        maxNewTokens: maxNewTokens,
+                        blockTokens: blockTokens,
+                        stopTokenIDs: stopTokenIDs,
+                        suppressTokenIDs: suppressTokenIDs,
+                        draftSinkSize: draftSinkSize,
+                        draftWindowSize: draftWindowSize,
+                        yield: { event in
+                            guard !Task.isCancelled else { return }
+                            continuation.yield(event)
+                        }
+                    )
+                } catch {
+                    // `generate()` returns a plain `AsyncStream<DFlashEvent>`, not
+                    // an `AsyncThrowingStream`, so a failure here (e.g. cache
+                    // construction failing inside `makeTargetCache`) cannot be
+                    // re-thrown to the consumer. Log it and end the stream early;
+                    // this mirrors the pre-existing behavior of any other early
+                    // return from this loop (the consumer just sees no more
+                    // events, exactly as if generation stopped normally).
+                    FileHandle.standardError.write(
+                        Data("[DFlashRuntime] generate() aborted: \(error)\n".utf8))
+                }
                 continuation.finish()
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -285,9 +300,9 @@ public enum DFlashRuntime {
         suppressTokenIDs: [Int]? = nil,
         draftSinkSize: Int = 64,
         draftWindowSize: Int = 1024
-    ) -> [DFlashEvent] {
+    ) throws -> [DFlashEvent] {
         var events: [DFlashEvent] = []
-        generateStreaming(
+        try generateStreaming(
             targetModel: targetModel,
             draftModel: draftModel,
             promptTokens: promptTokens,
@@ -316,7 +331,7 @@ public enum DFlashRuntime {
         draftSinkSize: Int,
         draftWindowSize: Int,
         yield: (DFlashEvent) -> Void
-    ) {
+    ) throws {
         let promptLen = promptTokens.count
         guard promptLen > 0 && maxNewTokens > 0 else { return }
 
@@ -329,7 +344,7 @@ public enum DFlashRuntime {
 
         let draftBackend = DFlashDraftBackend()
 
-        let targetCache = makeTargetCache(targetModel: targetModel)
+        let targetCache = try makeTargetCache(targetModel: targetModel)
 
         let draftCache = draftBackend.makeCache(
             draftModel: draftModel,
@@ -450,6 +465,10 @@ public enum DFlashRuntime {
         var prefetchedBlockLen: Int?
 
         while generatedTokenIDs.count < maxNewTokens {
+            // The consumer may be gone (stop sequence hit, client disconnected): the
+            // wrapper task is cancelled, and this loop must stop computing, not just
+            // stop yielding (#224).
+            if Task.isCancelled { break }
             let remaining = maxNewTokens - generatedTokenIDs.count
             let blockLen = max(1, min(effectiveBlockTokens, remaining))
 

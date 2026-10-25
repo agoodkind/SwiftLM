@@ -312,4 +312,14 @@ final class ChatRequestParsingTests: XCTestCase {
         XCTAssertEqual(req.tools?[0].function.name, "get_weather")
         XCTAssertEqual(req.tools?[0].function.description, "Get current weather for a city")
     }
+
+    // MARK: - Token limit field names
+
+    /// OpenAI deprecated `max_tokens` for `max_completion_tokens`; pi sends only the new
+    /// name for unrecognised providers, which SwiftLM used to ignore.
+    func testDecodesMaxCompletionTokens() throws {
+        let req = try decode(#"{"model":"m","messages":[],"max_completion_tokens":64}"#)
+        XCTAssertEqual(req.maxCompletionTokens, 64)
+        XCTAssertNil(req.maxTokens)
+    }
 }

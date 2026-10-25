@@ -12,7 +12,7 @@ final class AudioTests: XCTestCase {
             .deletingLastPathComponent() // SwiftLM
             
         let debugExecutableURL = projectRoot.appendingPathComponent(".build/arm64-apple-macosx/debug/SwiftLM")
-        let releaseExecutableURL = projectRoot.appendingPathComponent(".build/arm64-apple-macosx/release/SwiftLM")
+        let releaseExecutableURL = projectRoot.appendingPathComponent(".build/release/SwiftLM")
         
         let executableURL = FileManager.default.fileExists(atPath: debugExecutableURL.path) 
                             ? debugExecutableURL 

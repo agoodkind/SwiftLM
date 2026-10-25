@@ -8,7 +8,14 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on pull requests only. main is the release baseline and the
+  # trigger for the Release workflow, which fires on `workflow_run: completed` and refuses
+  # to publish unless CI concluded `success`. Rapid successive merges used to cancel the
+  # older main run mid-flight, which GitHub reports as `failure` with no test having
+  # failed, and made Release skip entirely. Letting each main commit finish is the point.
+  # (A bare `false` here would be a truthy string; the expression is what evaluates to a
+  # boolean.)
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build_and_unit_test:
@@ -18,6 +25,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
@@ -76,11 +86,64 @@ jobs:
     needs: build_and_unit_test
     runs-on: macos-15
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.modality == 'opencode' }}
     strategy:
       fail-fast: false
       matrix:
-        modality: [server, vision, audio, graph, omni, opencode]
+        # `models` is prefetched before the test runs. Without it the SwiftLM server
+        # downloads the model itself inside the test's 180 s startup window, which the
+        # 4.9 GB gemma-4 builds cannot make (audio/omni/opencode). Keep in sync with the
+        # model each tests/test-<modality>.sh actually loads.
+        include:
+          - modality: server
+            models: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+          # Same smoke test, KV-shared Gemma 4. e2b ships k_proj/v_proj for its shared
+          # layers while e4b omits them, so it exercises a weight layout no other job
+          # covers — a regression that broke it entirely still passed CI and shipped.
+          - modality: server
+            name_suffix: -gemma-e2b
+            models: mlx-community/gemma-4-e2b-it-4bit
+            test_model: mlx-community/gemma-4-e2b-it-4bit
+          # LFM2.5 used to be absent here and was fetched by the server mid-test, which
+          # is how it silently picked up a republished revision whose chat template was
+          # one brace short of valid and took main red. Prefetching it at a pinned
+          # revision is what makes this job depend on our code rather than on what
+          # upstream published that afternoon.
+          - modality: vision
+            models: mlx-community/Qwen2-VL-2B-Instruct-4bit LiquidAI/LFM2.5-VL-450M-MLX-4bit@10ce3604e42cd595497c47aaf67b7890e1e2a3b4
+          - modality: audio
+            models: mlx-community/gemma-4-e4b-it-4bit
+          - modality: graph
+            models: ""
+          # Synthetic checkpoints committed to the repository, a few hundred KB each,
+          # so this entry downloads nothing and needs no model cache. It covers the
+          # weight-and-config shapes behind #118, #120 and the b674 regression — the
+          # class of defect #128 found the unit suite has never caught, and which real
+          # checkpoints are too large to cover here (gemma-4-e2b alone is 3.6 GB
+          # against a 10 GB per-repository cache budget).
+          - modality: fixtures
+            models: ""
+          # OpenAI-compatibility contract: what the client receives over the wire, once
+          # real tokenisation decides chunk boundaries. Runs on the smallest model —
+          # these assert server behaviour, not model quality (issue #128).
+          - modality: contract
+            models: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+          # Hybrid (recurrent + attention) prompt cache. A prompt that diverges from a
+          # cached one resumes from a recurrent-state checkpoint instead of re-prefilling
+          # from zero; the unit suite only checks that bookkeeping against synthetic
+          # caches, so this job is what holds the end-to-end claim that a checkpoint
+          # resume computes the same thing as a full prefill. Qwen3.5 is the hybrid
+          # architecture under test, and the 0.8B build keeps the download small.
+          - modality: hybrid-cache
+            models: mlx-community/Qwen3.5-0.8B-MLX-4bit
+            test_model: mlx-community/Qwen3.5-0.8B-MLX-4bit
+          - modality: omni
+            models: mlx-community/gemma-4-e4b-it-4bit
+          # No longer continue-on-error: Test 2 used to shell out to the opencode npm
+          # CLI, which the runner OOM-killed after the server had already answered
+          # correctly. It now issues the request shape opencode sends, so a failure here
+          # means SwiftLM misbehaved and should block.
+          - modality: opencode
+            models: mlx-community/gemma-4-e4b-it-4bit
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,15 +158,38 @@ jobs:
       - name: Restore Architecture Privileges
         run: chmod +x .build/release/SwiftLM
 
-      - name: Cache MLX model
+      # The key is per-modality and derived from the test script, so changing the model a
+      # test loads rotates the key automatically. The previous static
+      # `mlx-model-qwen2.5-0.5b-4bit` key could never be re-saved once created
+      # (actions/cache does not overwrite an existing key), so the gemma-4 modalities kept
+      # restoring a cache that had never contained their model.
+      - name: Cache MLX models (${{ matrix.modality }})
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-model-qwen2.5-0.5b-4bit
-          
-      - name: Run E2E tests (${{ matrix.modality }})
+          key: hf-models-v2-${{ matrix.modality }}${{ matrix.name_suffix }}-${{ hashFiles(format('tests/test-{0}.sh', matrix.modality)) }}
+          restore-keys: |
+            hf-models-v2-${{ matrix.modality }}${{ matrix.name_suffix }}-
+
+      - name: Set up HuggingFace CLI
+        if: matrix.models != ''
+        run: |
+          python3 -m venv /tmp/hf_venv
+          /tmp/hf_venv/bin/pip install --quiet huggingface_hub hf
+
+      - name: Pre-download models (${{ matrix.modality }})
+        if: matrix.models != ''
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
+        run: |
+          source /tmp/hf_venv/bin/activate
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh ${{ matrix.models }}
+
+      - name: Run E2E tests (${{ matrix.modality }}${{ matrix.name_suffix }})
         env:
           HF_HUB_DOWNLOAD_TIMEOUT: "600"
+          SWIFTLM_TEST_MODEL: ${{ matrix.test_model }}
         run: |
           chmod +x tests/test-${{ matrix.modality }}.sh
           for attempt in 1 2 3; do
@@ -132,6 +218,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
@@ -183,13 +272,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-speculative-qwen35-2b-0.8b
+          key: mlx-speculative-qwen35-2b-0.8b-v2
 
       - name: Pre-download HuggingFace models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-2B-4bit || true
-          hf download mlx-community/Qwen3.5-0.8B-MLX-4bit || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-2B-4bit \
+            mlx-community/Qwen3.5-0.8B-MLX-4bit
 
       - name: Run speculative decoding E2E
         env:
@@ -228,6 +321,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
@@ -277,13 +373,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-dflash-qwen35-4b
+          key: mlx-dflash-qwen35-4b-v2
 
       - name: Pre-download HuggingFace models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-4B-4bit || true
-          hf download z-lab/Qwen3.5-4B-DFlash || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-4B-4bit \
+            z-lab/Qwen3.5-4B-DFlash
 
       - name: Run DFlash E2E
         env:
@@ -323,7 +423,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      
+
+      - name: Select Xcode 26 (Swift 6.2)
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
       - name: Install Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain || true
 
@@ -374,13 +477,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-speculative-eval-qwen35-2b-0.8b
+          key: mlx-speculative-eval-qwen35-2b-0.8b-v2
 
       - name: Pre-download HuggingFace models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-2B-4bit || true
-          hf download mlx-community/Qwen3.5-0.8B-MLX-4bit || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-2B-4bit \
+            mlx-community/Qwen3.5-0.8B-MLX-4bit
 
       - name: Snapshot RAM before test
         id: ram_before
@@ -478,6 +585,10 @@ jobs:
           name: swiftlm-architecture
           path: .build/release/
 
+      - name: Select Xcode 26 (Swift 6.2)
+        if: hashFiles('.build/release/SwiftLM') == ''
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
       - name: Build (Release) if artifact missing
         run: |
           if [ ! -f ".build/release/SwiftLM" ]; then
@@ -495,13 +606,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-ssd-draft-guard-qwen35-2b-0.8b
+          key: mlx-ssd-draft-guard-qwen35-2b-0.8b-v2
 
       - name: Pre-download models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-2B-4bit || true
-          hf download mlx-community/Qwen3.5-0.8B-MLX-4bit || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-2B-4bit \
+            mlx-community/Qwen3.5-0.8B-MLX-4bit
 
       - name: Snapshot RAM baseline
         id: ram_base
