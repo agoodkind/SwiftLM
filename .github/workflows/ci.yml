@@ -96,9 +96,9 @@ jobs:
   lmd_consumer:
     name: LMD consumer
     needs: lmd_sources
-    uses: agoodkind/lmd/.github/workflows/lmd_integration.yml@98e2d161b4bb35aac1a1e02ef4f1b7c38fa2e623
+    uses: agoodkind/lmd/.github/workflows/lmd_integration.yml@c94f02841b230a17b612e4c6bf6e7e8b35360d96
     with:
-      lmd_ref: 98e2d161b4bb35aac1a1e02ef4f1b7c38fa2e623
+      lmd_ref: c94f02841b230a17b612e4c6bf6e7e8b35360d96
       core_ref: ${{ needs.lmd_sources.outputs.core_ref }}
       library_ref: ${{ needs.lmd_sources.outputs.library_ref }}
       swiftlm_ref: ${{ needs.lmd_sources.outputs.swiftlm_ref }}
