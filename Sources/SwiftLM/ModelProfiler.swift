@@ -31,6 +31,14 @@ struct ModelProfile: Sendable {
     let numActiveExperts: Int?
     let weightFileSizeBytes: Int
     let modelId: String
+    /// Attention layout from `layer_types`. When a config has no `layer_types`,
+    /// every layer counts as full attention, which is the old estimate.
+    var fullAttentionLayers: Int? = nil
+    var slidingAttentionLayers: Int = 0
+    var slidingWindow: Int? = nil
+    /// Gemma 4 gives its full-attention layers their own KV head count and head dim.
+    var globalKVHeads: Int? = nil
+    var globalHeadDim: Int? = nil
 
     /// Estimated total parameters in billions (rough)
     var estimatedParamsB: Double {
@@ -55,10 +63,19 @@ struct ModelProfile: Sendable {
 
     /// KV cache memory in GB for a given context length
     func kvCacheMemoryGB(contextLength: Int) -> Double {
-        // KV cache = 2 (K + V) × layers × kv_heads × head_dim × context × 2 bytes (FP16)
+        // KV cache = 2 (K + V) × layers × kv_heads × head_dim × tokens × 2 bytes (FP16).
+        // Only attention layers hold a KV cache. Linear-attention layers (GatedDeltaNet)
+        // keep a fixed-size state instead, and sliding-window layers stop growing at the
+        // window size. Counting every layer as full attention overestimated Gemma 4 by
+        // ~10× and Qwen3.5/3.8 by ~4×, which pushed 32 GB machines into CPU
+        // partitioning they didn't need.
         let bytesPerElement = 2 // FP16
-        let kvBytes = 2 * numLayers * numKVHeads * headDim * contextLength * bytesPerElement
-        return Double(kvBytes) / 1e9
+        let fullLayers = fullAttentionLayers ?? numLayers
+        let fullBytes = 2 * fullLayers * (globalKVHeads ?? numKVHeads) * (globalHeadDim ?? headDim)
+            * contextLength * bytesPerElement
+        let slidingTokens = min(contextLength, slidingWindow ?? contextLength)
+        let slidingBytes = 2 * slidingAttentionLayers * numKVHeads * headDim * slidingTokens * bytesPerElement
+        return Double(fullBytes + slidingBytes) / 1e9
     }
 
     /// Total memory required in GB (weights + KV cache + overhead)
@@ -175,10 +192,12 @@ enum ModelProfiler {
         let headDim: Int?
         let intermediateSize: Int?
         let vocabSize: Int?
-        let numExperts: Int?
-        let numExpertsPerTok: Int?
         let quantizationConfig: QuantConfig?
         let textConfig: TextConfig?
+        let layerTypes: [String]?
+        let slidingWindow: Int?
+        let numGlobalKeyValueHeads: Int?
+        let globalHeadDim: Int?
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
@@ -189,10 +208,12 @@ enum ModelProfiler {
             case headDim = "head_dim"
             case intermediateSize = "intermediate_size"
             case vocabSize = "vocab_size"
-            case numExperts = "num_local_experts"
-            case numExpertsPerTok = "num_experts_per_tok"
             case quantizationConfig = "quantization_config"
             case textConfig = "text_config"
+            case layerTypes = "layer_types"
+            case slidingWindow = "sliding_window"
+            case numGlobalKeyValueHeads = "num_global_key_value_heads"
+            case globalHeadDim = "global_head_dim"
         }
     }
 
@@ -204,6 +225,10 @@ enum ModelProfiler {
         let headDim: Int?
         let intermediateSize: Int?
         let vocabSize: Int?
+        let layerTypes: [String]?
+        let slidingWindow: Int?
+        let numGlobalKeyValueHeads: Int?
+        let globalHeadDim: Int?
 
         enum CodingKeys: String, CodingKey {
             case numHiddenLayers = "num_hidden_layers"
@@ -213,6 +238,10 @@ enum ModelProfiler {
             case headDim = "head_dim"
             case intermediateSize = "intermediate_size"
             case vocabSize = "vocab_size"
+            case layerTypes = "layer_types"
+            case slidingWindow = "sliding_window"
+            case numGlobalKeyValueHeads = "num_global_key_value_heads"
+            case globalHeadDim = "global_head_dim"
         }
     }
 
@@ -236,7 +265,13 @@ enum ModelProfiler {
             return nil
         }
 
-        guard let config = try? JSONDecoder().decode(ModelConfig.self, from: configData) else {
+        let config: ModelConfig
+        do {
+            config = try JSONDecoder().decode(ModelConfig.self, from: configData)
+        } catch {
+            // Silence here meant a profile of nil with no explanation, on the very code
+            // path whose original bug (#112) was a diagnosability failure.
+            print("[ModelProfiler] Could not parse \(configURL.path): \(error)")
             return nil
         }
 
@@ -251,16 +286,31 @@ enum ModelProfiler {
         // Detect quantization
         let quantBits = config.quantizationConfig?.bits ?? detectQuantBits(modelId: modelId)
 
-        // Detect MoE
-        let isMoE = config.numExperts != nil && (config.numExperts ?? 0) > 1
-        let numExperts = config.numExperts
-        let numActiveExperts = config.numExpertsPerTok
+        // Detect MoE.
+        //
+        // Issue #112: expert counts are spelled differently per architecture family,
+        // so relying on a single key silently misclassified Qwen3.5-MoE / DeepSeek /
+        // GLM MoE models as dense. That disabled --stream-experts and made the server
+        // materialise the full model, which the OS then OOM-killed. findExpertCounts
+        // walks the raw config for every known spelling, at any nesting depth.
+        //
+        // An explicit count is authoritative in both directions: a config that says it
+        // has one expert is dense, whatever its model_type is called. The model_type
+        // heuristic applies only when no known key was present at all.
+        let rawConfig = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
+        let expertCounts: (total: Int?, active: Int?) =
+            rawConfig.map { findExpertCounts(in: $0) } ?? (total: nil, active: nil)
+        let numExperts = expertCounts.total
+        let numActiveExperts = expertCounts.active
+        let modelType = config.modelType ?? "unknown"
+        let isMoE = numExperts.map { $0 > 1 } ?? modelTypeImpliesMoE(modelType)
 
         // Measure weight file sizes on disk (only for MoE to avoid slow walks on dense models)
         let weightSize = isMoE ? measureWeightFiles(directory: modelDirectory) : 0
 
-        return ModelProfile(
-            modelType: config.modelType ?? "unknown",
+        let layerTypes = config.layerTypes ?? config.textConfig?.layerTypes
+        var profile = ModelProfile(
+            modelType: modelType,
             numLayers: numLayers,
             hiddenSize: hiddenSize,
             numAttentionHeads: numHeads,
@@ -275,6 +325,115 @@ enum ModelProfiler {
             weightFileSizeBytes: weightSize,
             modelId: modelId
         )
+        if let layerTypes, layerTypes.count == numLayers {
+            // Anything that isn't sliding or linear attention is treated as full attention.
+            let sliding = layerTypes.filter { $0 == "sliding_attention" }.count
+            let linear = layerTypes.filter { $0 == "linear_attention" }.count
+            profile.slidingAttentionLayers = sliding
+            profile.fullAttentionLayers = layerTypes.count - sliding - linear
+            profile.slidingWindow = config.slidingWindow ?? config.textConfig?.slidingWindow
+            if sliding > 0 && profile.slidingWindow == nil {
+                // Can't cap a window we don't know, so count those layers as full.
+                profile.fullAttentionLayers = layerTypes.count - linear
+                profile.slidingAttentionLayers = 0
+            }
+        }
+        profile.globalKVHeads = config.numGlobalKeyValueHeads ?? config.textConfig?.numGlobalKeyValueHeads
+        profile.globalHeadDim = config.globalHeadDim ?? config.textConfig?.globalHeadDim
+        return profile
+    }
+
+    /// Routed-expert count keys, in precedence order within a container.
+    private static let expertTotalKeys = ["num_local_experts", "num_experts", "n_routed_experts"]
+
+    /// Sub-config containers that hold a language model, tried before other children so
+    /// the result does not depend on dictionary iteration order. Qwen3-Omni carries a
+    /// count under both `talker_config` and `thinker_config` with *different* active
+    /// counts, so an unordered walk would report a different number run to run.
+    private static let languageContainerPriority = [
+        "text_config", "thinker_config", "language_config", "language_model",
+        "llm_config", "decoder_config",
+    ]
+
+    /// Containers that are definitely not the language model. Without this, a count in a
+    /// shallower non-LM container outranks the real one nested deeper — the priority list
+    /// only orders siblings within a level, it cannot stop the walk descending into an
+    /// encoder that happens to be MoE.
+    private static let nonLanguageContainers: Set<String> = [
+        "vision_config", "audio_config", "code2wav_config", "projector_config",
+        "visual", "vision_tower", "audio_tower", "speech_config", "image_config",
+    ]
+
+    /// Finds the routed-expert count by walking nested containers breadth-first.
+    ///
+    /// Multimodal wrappers nest the language model at varying depths and under varying
+    /// names — `text_config` (Qwen3.5-VL), `language_config` (DeepSeek-VL2, whose
+    /// model_type contains no "moe" so nothing else would catch it), and
+    /// `thinker_config.text_config` two levels down (Qwen3-Omni). Breadth-first keeps an
+    /// outer explicit count authoritative over one nested deeper, and non-positive
+    /// values are skipped as placeholders (issue #112 and its review follow-ups).
+    static func findExpertCounts(in root: [String: Any], maxDepth: Int = 3)
+        -> (total: Int?, active: Int?)
+    {
+        // Carried down so a container that declares a total but no per-token count can
+        // inherit one from an ancestor, which is how wrappers that hoist
+        // `num_experts_per_tok` to the top level are written.
+        var level: [(container: [String: Any], inheritedActive: Int?)] = [(root, nil)]
+        var depth = 0
+        while !level.isEmpty && depth <= maxDepth {
+            for (container, inheritedActive) in level {
+                for key in expertTotalKeys {
+                    guard let total = intValue(container[key]), total > 0 else { continue }
+                    // Prefer this container's own per-token count; fall back to the
+                    // nearest ancestor that had one.
+                    let own = intValue(container["num_experts_per_tok"]).flatMap { $0 > 0 ? $0 : nil }
+                    return (total, own ?? inheritedActive)
+                }
+            }
+            var next: [(container: [String: Any], inheritedActive: Int?)] = []
+            for (container, inheritedActive) in level {
+                let childKeys = container.keys.filter {
+                    container[$0] is [String: Any] && !nonLanguageContainers.contains($0)
+                }
+                let ordered =
+                    languageContainerPriority.filter(childKeys.contains)
+                    + childKeys.filter { !languageContainerPriority.contains($0) }.sorted()
+                let activeHere =
+                    intValue(container["num_experts_per_tok"]).flatMap { $0 > 0 ? $0 : nil }
+                    ?? inheritedActive
+                for key in ordered {
+                    if let child = container[key] as? [String: Any] {
+                        next.append((child, activeHere))
+                    }
+                }
+            }
+            level = next
+            depth += 1
+        }
+        return (nil, nil)
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        switch value {
+        case let v as Int: return v
+        case let v as NSNumber: return v.intValue
+        case let v as String: return Int(v)
+        default: return nil
+        }
+    }
+
+    /// Last-resort MoE detection for configs whose expert-count key we do not know.
+    /// Reached only when no known expert key was present at all.
+    ///
+    /// A false positive is not free: it clears the guard in Server.swift, which then
+    /// enables lazy loading, activates SSD expert streaming and overrides the MLX
+    /// memory and cache limits. It is still the safer direction — that path only runs
+    /// when the user explicitly passed --stream-experts, whereas a false negative
+    /// materialises the whole model and gets the process OOM-killed (issue #112).
+    static func modelTypeImpliesMoE(_ modelType: String) -> Bool {
+        let normalized = modelType.lowercased()
+        if normalized.contains("moe") { return true }
+        return ["mixtral", "dbrx", "grok"].contains { normalized.contains($0) }
     }
 
     /// Detect quantization bits from model ID string patterns.
@@ -396,7 +555,15 @@ enum ModelProfiler {
         switch strategy {
         case .fullGPU:
             memoryLimit = Int(Double(system.recommendedWorkingSetBytes) * 1.5)
-            cacheLimit = system.recommendedWorkingSetBytes // default
+            // MLX's default cache limit is the whole working set. Prefill chunk
+            // buffers change shape as the KV offset grows, so they are rarely
+            // reused and the cache just keeps growing. On a 32 GB machine that
+            // pushed macOS into swap by ~8K tokens. Give the cache half of what
+            // is left after weights, KV and an 8 GB OS reserve, and never more
+            // than the old default.
+            let headroomGB = system.totalRAMGB - (weightGB + draftGB) - kvGB - 8.0
+            let budget = Int(max(1.0, headroomGB / 2) * 1e9)
+            cacheLimit = min(system.recommendedWorkingSetBytes, budget)
         case .swapAssisted:
             memoryLimit = 200 * 1024 * 1024 * 1024 // 200 GB sentinel to bypass MLX eval_impl spin loop (let macOS swap handle it)
             cacheLimit = 2 * 1024 * 1024 // 2MB — let OS manage caching

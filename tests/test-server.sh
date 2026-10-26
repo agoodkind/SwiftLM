@@ -12,7 +12,8 @@ set -euo pipefail
 BINARY="${1:-.build/release/SwiftLM}"
 PORT="${2:-15413}"
 HOST="127.0.0.1"
-MODEL="mlx-community/Qwen2.5-0.5B-Instruct-4bit"  # Smallest model for CI
+# Overridable so the same smoke test can cover more than one architecture in CI.
+MODEL="${SWIFTLM_TEST_MODEL:-mlx-community/Qwen2.5-0.5B-Instruct-4bit}"  # Smallest model for CI
 URL="http://${HOST}:${PORT}"
 PASS=0
 FAIL=0
@@ -34,6 +35,14 @@ cleanup() {
         kill -9 "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    if [ -n "${TERM_SERVER_PID:-}" ]; then
+        kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
+        wait "$TERM_SERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "${TERM_CURL_PID:-}" ]; then
+        kill "$TERM_CURL_PID" 2>/dev/null || true
+    fi
+    rm -f "${TERM_LOG:-}" "${TERM_STREAM:-}"
     if [ -n "${CORS_SERVER_PID:-}" ]; then
         log "Stopping CORS server (PID $CORS_SERVER_PID)"
         kill -9 "$CORS_SERVER_PID" 2>/dev/null || true
@@ -1124,6 +1133,158 @@ else
     fail "Text streaming + opt-in header: failed or missing [DONE]"
 fi
 
+
+# ── Test 37: /v1/models + /health respond during in-flight generation ────────
+# The main server runs with the default --parallel 1, so a generation request
+# holds the only slot. Control-plane endpoints must NOT queue behind it.
+log "Test 37: control-plane endpoints respond during in-flight generation"
+
+INFLIGHT_PROBE_OK=true
+curl -sf -N -X POST "$URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$MODEL\",\"stream\":true,\"max_tokens\":150,\"messages\":[{\"role\":\"user\",\"content\":\"Count from one to one hundred, one number per line.\"}]}" \
+    --max-time 90 \
+    -o /tmp/mlx_inflight_stream.txt &
+INFLIGHT_PID=$!
+
+sleep 1.0
+
+curl -sf --max-time 3 "$URL/v1/models" -o /tmp/mlx_inflight_models.json || INFLIGHT_PROBE_OK=false
+curl -sf --max-time 3 "$URL/health" -o /tmp/mlx_inflight_health.json || INFLIGHT_PROBE_OK=false
+
+wait "$INFLIGHT_PID" || INFLIGHT_PROBE_OK=false
+
+if [ "$INFLIGHT_PROBE_OK" = true ] \
+    && jq -e '.data | length > 0' /tmp/mlx_inflight_models.json >/dev/null 2>&1 \
+    && grep -q "data: \[DONE\]" /tmp/mlx_inflight_stream.txt 2>/dev/null; then
+    pass "In-flight probe: /v1/models + /health answered within 3s while generation held the slot"
+else
+    fail "In-flight probe: endpoint blocked/timed out, or in-flight stream did not complete"
+fi
+rm -f /tmp/mlx_inflight_models.json /tmp/mlx_inflight_health.json /tmp/mlx_inflight_stream.txt
+
+
+# ── Test 38: streaming TTFB — headers + ": connected" before model prefill ───
+# Regression test for the silent-prefill stall: the handler used to run the
+# whole prefill inside container.perform before returning headers, so clients
+# saw no bytes for the entire prefill (Bun fetch 10s idle → ECONNRESET/retry).
+# A large prompt makes prefill multi-second; TTFB must stay well under that.
+# Under 2k tokens: 270 numbers measure 1,916 with the gemma-4-e2b tokenizer and
+# chat wrapper (300 were 2,126). Gemma-4 prefill allocates O(n²) attention in one Metal buffer
+# (~149 bytes × n² for gemma-4-e2b) and the CI runner caps a single buffer at
+# 3.5 GB, i.e. ~4.9k tokens max. 7k tokens crashed the server with a 7.4 GB
+# malloc; 2k tokens needs ~0.6 GB and still gives a measurable prefill.
+log "Test 38: streaming TTFB — ': connected' arrives before model prefill"
+
+python3 -c "print(' '.join(f'{i:06d}' for i in range(270)))" > /tmp/mlx_ttfb_prompt.txt
+jq -nc --arg m "$MODEL" --rawfile p /tmp/mlx_ttfb_prompt.txt \
+    '{model:$m, stream:true, max_tokens:5, messages:[{role:"user",content:("Summarize this list in one word:\n"+$p)}]}' \
+    > /tmp/mlx_ttfb_body.json
+
+TTFB=$(curl -sf -N -X POST "$URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    --data-binary @/tmp/mlx_ttfb_body.json \
+    --max-time 120 \
+    -o /tmp/mlx_ttfb_stream.txt \
+    -w '%{time_starttransfer}' 2>/dev/null || true)
+
+TTFB_OK=false
+if [ -n "$TTFB" ] && awk "BEGIN{exit !($TTFB < 2.0)}" 2>/dev/null; then
+    TTFB_OK=true
+fi
+
+CONNECTED_OK=false
+if head -5 /tmp/mlx_ttfb_stream.txt 2>/dev/null | grep -q ": connected"; then
+    CONNECTED_OK=true
+fi
+
+DONE_OK=false
+if grep -q "data: \[DONE\]" /tmp/mlx_ttfb_stream.txt 2>/dev/null; then
+    DONE_OK=true
+fi
+
+if [ "$TTFB_OK" = true ] && [ "$CONNECTED_OK" = true ] && [ "$DONE_OK" = true ]; then
+    pass "Early TTFB: first byte in ${TTFB}s (< 2s, prefill deferred), ': connected' sent, stream completed"
+else
+    fail "Early TTFB: ttfb='${TTFB}' (<2s: $TTFB_OK), ': connected': $CONNECTED_OK, [DONE]: $DONE_OK"
+fi
+rm -f /tmp/mlx_ttfb_prompt.txt /tmp/mlx_ttfb_body.json /tmp/mlx_ttfb_stream.txt
+
+
+# ── Test 39: SIGTERM during generation exits cleanly ─────────────────
+# A shutdown request mid-stream must exit 0 with exiting{reason:"requested"} on its
+# own line (exit() used to race an in-flight GPU eval and crash, #197). A crash
+# shows up as a nonzero status; crash reports are written too late to check here.
+log "Test 39: SIGTERM during a streaming generation"
+TERM_PORT=$((PORT + 3))
+TERM_LOG=$(mktemp)
+TERM_STREAM=$(mktemp)
+"$BINARY" --model "$MODEL" --port "$TERM_PORT" --host "$HOST" > "$TERM_LOG" 2>&1 &
+TERM_SERVER_PID=$!
+TERM_READY=false
+for i in $(seq 1 120); do
+    if curl -sf "http://${HOST}:${TERM_PORT}/health" >/dev/null 2>&1; then
+        TERM_READY=true
+        break
+    fi
+    kill -0 "$TERM_SERVER_PID" 2>/dev/null || break
+    sleep 1
+done
+
+if [ "$TERM_READY" != true ]; then
+    fail "SIGTERM mid-stream: server did not become ready"
+    tail -40 "$TERM_LOG" || true
+    cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
+    kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
+    wait "$TERM_SERVER_PID" 2>/dev/null || true
+    unset TERM_SERVER_PID
+else
+    curl -sN -X POST "http://${HOST}:${TERM_PORT}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$MODEL\",\"stream\":true,\"max_tokens\":2048,\"messages\":[{\"role\":\"user\",\"content\":\"Write a very long story about a lighthouse keeper.\"}]}" \
+        > "$TERM_STREAM" 2>/dev/null &
+    TERM_CURL_PID=$!
+    for i in $(seq 1 200); do
+        grep -q '"content"' "$TERM_STREAM" 2>/dev/null && break
+        sleep 0.1
+    done
+    kill -TERM "$TERM_SERVER_PID" 2>/dev/null || true
+
+    # Bounded wait: a shutdown hang must fail here, not at the job timeout.
+    TERM_HUNG=false
+    for i in $(seq 1 300); do
+        kill -0 "$TERM_SERVER_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$TERM_SERVER_PID" 2>/dev/null; then
+        TERM_HUNG=true
+        kill -9 "$TERM_SERVER_PID" 2>/dev/null || true
+    fi
+    TERM_STATUS=0
+    wait "$TERM_SERVER_PID" 2>/dev/null || TERM_STATUS=$?
+    unset TERM_SERVER_PID
+    kill "$TERM_CURL_PID" 2>/dev/null || true
+    wait "$TERM_CURL_PID" 2>/dev/null || true
+    unset TERM_CURL_PID
+
+    # Each line on its own: a line that is not exactly one JSON object (an echoed
+    # token, or the event with a token glued on) must not count.
+    TERM_REASON=$(jq -rR 'fromjson? | select(type == "object" and .event == "exiting") | .reason' \
+        "$TERM_LOG" 2>/dev/null | tail -1 || true)
+    if [ "$TERM_HUNG" = true ]; then
+        fail "SIGTERM mid-stream: server still running 30s after SIGTERM"
+        tail -40 "$TERM_LOG" || true
+        cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
+    elif [ "$TERM_STATUS" -eq 0 ] && [ "$TERM_REASON" = "requested" ]; then
+        pass "SIGTERM mid-stream: exit 0, exiting{requested} on its own line"
+    else
+        fail "SIGTERM mid-stream: status=$TERM_STATUS reason='${TERM_REASON}'"
+        tail -40 "$TERM_LOG" || true
+        cp "$TERM_LOG" /tmp/SwiftLM-test-sigterm.log 2>/dev/null || true
+    fi
+fi
+rm -f "$TERM_LOG" "$TERM_STREAM"
+unset TERM_LOG TERM_STREAM
 
 # ── Results ──────────────────────────────────────────────────────────
 echo ""

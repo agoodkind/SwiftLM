@@ -51,7 +51,9 @@ else
     exit 1
 fi
 METALLIB_BUILD_DIR=".build/metallib_build"
-METALLIB_DEST=".build/arm64-apple-macosx/release"
+# Ask SwiftPM for the real bin dir: Swift 6.4+ builds into .build/out/Products/Release
+# instead of .build/arm64-apple-macosx/release.
+METALLIB_DEST="$(swift build -c release --show-bin-path)"
 
 rm -rf "$METALLIB_BUILD_DIR"
 mkdir -p "$METALLIB_BUILD_DIR"
@@ -77,25 +79,19 @@ fi
 
 popd > /dev/null
 
-# Copy the freshly built metallib next to the binary, explicitly naming it default.metallib for mlx-c
+# Copy the freshly built metallib next to the binary. MLX loads a colocated
+# mlx.metallib before anything else, so that name guarantees the full kernel set
+# wins over the partial default.metallib SwiftPM puts in mlx-swift_Cmlx.bundle.
+# default.metallib is kept for mlx-c.
 mkdir -p "$METALLIB_DEST"
-if [ -f "$METALLIB_BUILD_DIR/lib/mlx.metallib" ]; then
-    cp "$METALLIB_BUILD_DIR/lib/mlx.metallib" "$METALLIB_DEST/default.metallib"
-    echo "✅ Built and copied default.metallib to $METALLIB_DEST/"
-elif [ -f "$METALLIB_BUILD_DIR/mlx.metallib" ]; then
-    cp "$METALLIB_BUILD_DIR/mlx.metallib" "$METALLIB_DEST/default.metallib"
-    echo "✅ Built and copied default.metallib to $METALLIB_DEST/"
-else
-    # Search for it anywhere in the build dir
-    BUILT=$(find "$METALLIB_BUILD_DIR" -name "mlx.metallib" | head -1)
-    if [ -n "$BUILT" ]; then
-        cp "$BUILT" "$METALLIB_DEST/default.metallib"
-        echo "✅ Built and copied default.metallib to $METALLIB_DEST/"
-    else
-        echo "❌ Failed to build mlx.metallib. Check cmake output above."
-        exit 1
-    fi
+BUILT=$(find "$METALLIB_BUILD_DIR" -name "mlx.metallib" | head -1)
+if [ -z "$BUILT" ]; then
+    echo "❌ Failed to build mlx.metallib. Check cmake output above."
+    exit 1
 fi
+cp "$BUILT" "$METALLIB_DEST/mlx.metallib"
+cp "$BUILT" "$METALLIB_DEST/default.metallib"
+echo "✅ Built and copied mlx.metallib + default.metallib to $METALLIB_DEST/"
 
 # --- 4. Build SwiftLM ---
 echo ""
@@ -105,6 +101,6 @@ swift build -c release
 echo ""
 echo "=============================================="
 echo "✅ Build complete!"
-echo "   Binary:   .build/release/SwiftLM"
+echo "   Binary:   $METALLIB_DEST/SwiftLM"
 echo "   Metallib: $METALLIB_DEST/mlx.metallib"
 echo "=============================================="

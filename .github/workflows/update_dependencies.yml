@@ -1,51 +1,47 @@
 name: Dependency Automation
 
+# Prepare a bump branch for a person to review and open as a pull request.
 on:
   repository_dispatch:
     types: [dependency_bump]
 
 permissions:
   contents: write
-  pull-requests: write
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   bump-dependencies:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    container: swift:6.3.2-noble@sha256:c4336909a71b2e69b884f4078cdf98c0cd081911632cb349ef72abc4cbed69fc
+    timeout-minutes: 60
     steps:
-      - name: Checkout Code
+      - name: Refresh Ubuntu package metadata
+        run: apt-get update
+
+      - name: Install portable build prerequisites
+        run: apt-get install --yes --no-install-recommends make curl
+
+      - name: Checkout the candidate repository
         uses: actions/checkout@v4
         with:
+          path: candidate
           submodules: recursive
           fetch-depth: 0
 
-      - name: Update swift-mlx dependencies
-        if: ${{ github.event.client_payload.source_repo == 'mlx-swift' }}
-        run: |
-          echo "Bumping mlx-swift dependency to ${{ github.event.client_payload.new_tag }}"
-          # In Package.swift we depend on branch main, but if we wanted to depend on a tag:
-          # SwiftPM resolves "main" to the latest commit automatically, but updating the SPM resolved file ensures deterministic builds:
-          swift package update mlx-swift
-
-      - name: Update swift-mlx-lm dependencies
-        if: ${{ github.event.client_payload.source_repo == 'mlx-swift-lm' }}
-        run: |
-          echo "Bumping local mlx-swift-lm submodule to ${{ github.event.client_payload.new_tag }}"
-          git submodule update --remote mlx-swift-lm
-          # Force the submodule onto the specific new release tag
-          cd mlx-swift-lm
-          git checkout ${{ github.event.client_payload.new_tag }}
-          cd ..
-          git add mlx-swift-lm
-
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
+      - name: Verify the fixed Swift dependency bump command
+        id: maintenance
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@ec18740170edb9c5c2216a9c6fe2789c3d9926b4
         with:
-          token: ${{ secrets.SWIFTLM_PR_TOKEN }}
-          commit-message: "chore(deps): bump ${{ github.event.client_payload.source_repo }} to ${{ github.event.client_payload.new_tag }}"
-          title: "Update ${{ github.event.client_payload.source_repo }} Dependency to ${{ github.event.client_payload.new_tag }}"
-          body: |
-            Automated dependency update triggered by release `${{ github.event.client_payload.new_tag }}` in `SharpAI/${{ github.event.client_payload.source_repo }}`.
-            
-            This PR ensures SwiftLM is tracking the latest validated architectural improvements.
-          branch: "auto-update/${{ github.event.client_payload.source_repo }}-${{ github.event.client_payload.new_tag }}"
-          base: main
+          ref: '2812aa0d79c00cda8185e11182e98ddea59eb6be'
+          test-filter: DependencyBumpTests
+
+      - name: Prepare a dependency branch for manual review
+        id: bump
+        env:
+          MAINTENANCE_BIN: ${{ steps.maintenance.outputs.binary }}
+          PAYLOAD_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          PAYLOAD_NEW_TAG: ${{ github.event.client_payload.new_tag }}
+        run: '"$MAINTENANCE_BIN" bump-dependency "$GITHUB_WORKSPACE/candidate"'

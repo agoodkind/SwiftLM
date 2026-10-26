@@ -147,7 +147,7 @@ struct Gemma4MTPBench: AsyncParsableCommand {
             let t0 = Date()
             var it = try TokenIterator(
                 input: input, model: mainCtx.model,
-                cache: mainCtx.model.newCache(parameters: params),
+                cache: try mainCtx.model.newCache(parameters: params),
                 parameters: params)
             while let tok = it.next() {
                 baseOut.append(tok)
@@ -179,7 +179,7 @@ struct Gemma4MTPBench: AsyncParsableCommand {
         let mtpT0 = Date()
         var mtpIt = try MTPTokenIterator(
             input: input, model: asstModel,
-            cache: mainCtx.model.newCache(parameters: params),
+            cache: try mainCtx.model.newCache(parameters: params),
             parameters: params, numMTPTokens: numDraft)
         while let tok = mtpIt.next() {
             mtpOut.append(tok)

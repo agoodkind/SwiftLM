@@ -1,6 +1,6 @@
 import subprocess, time, json, urllib.request, os, signal
 
-SWIFTLM_PATH = ".build/arm64-apple-macosx/release/SwiftLM"
+SWIFTLM_PATH = ".build/release/SwiftLM"
 MAIN_MODEL = "mlx-community/gemma-4-26b-a4b-it-4bit"
 DRAFT_MODEL = "mlx-community/gemma-4-e4b-it-4bit"
 

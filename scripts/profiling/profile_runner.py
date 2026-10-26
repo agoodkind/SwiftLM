@@ -16,7 +16,7 @@ CONFIGS = [
     {"name": "MTP + TurboQuant", "flags": ["--stream-experts", "--mtp", "--num-mtp-tokens", "4", "--turbo-kv"]},
 ]
 
-SWIFTLM_PATH = ".build/arm64-apple-macosx/release/SwiftLM"
+SWIFTLM_PATH = ".build/release/SwiftLM"
 
 def get_physical_ram_gb():
     try:

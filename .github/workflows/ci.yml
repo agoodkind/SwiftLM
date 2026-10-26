@@ -5,110 +5,577 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_pretrained_smoke:
+        description: Download pretrained models and run modality and SwiftBuddy tests
+        type: boolean
+        default: false
+      run_speculative_smoke:
+        description: Download pretrained models and run speculative and DFlash smoke tests
+        type: boolean
+        default: false
+      run_speculative_eval:
+        description: Download pretrained models and evaluate speculative decoding memory
+        type: boolean
+        default: false
+      run_ssd_draft_guard:
+        description: Download pretrained models and run the SSD draft memory guard
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  SWIFTLM_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+  DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+  MACOSX_DEPLOYMENT_TARGET: '14.0'
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  build_and_unit_test:
-    runs-on: macos-15
+  select_macos_runner:
+    name: Select macOS runner
+    runs-on: ubuntu-latest
     timeout-minutes: 40
+    outputs:
+      label: ${{ steps.runner.outputs.label }}
+    steps:
+      - name: Use the shared macOS runner selector
+        id: runner
+        uses: agoodkind/swift-makefile/.github/actions/plan-runner@main
+        with:
+          runner: macos-26
+          capacity-token: ${{ secrets.LOCAL_POOL_CAPACITY_TOKEN }}
+
+  lmd_sources:
+    name: Select LMD consumer sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      swiftlm_ref: ${{ steps.refs.outputs.swiftlm_ref }}
+      core_ref: ${{ steps.refs.outputs.core_ref }}
+      library_ref: ${{ steps.refs.outputs.library_ref }}
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          ref: ${{ env.SWIFTLM_REF }}
+          persist-credentials: false
 
-      - name: Install Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain || true
-
-      - name: Cache Swift packages
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: ${{ runner.os }}-spm-SwiftLM-v3-${{ hashFiles('Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-SwiftLM-v3-
-
-      - name: Clear stale module cache
-        run: find .build -type d -name ModuleCache -exec rm -rf {} + 2>/dev/null || true
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build (Release)
-        run: swift build -c release
-
-      - name: Verify binary
+      - name: Extract the selected source and gitlinks
+        id: refs
         run: |
-          ls -lh .build/release/SwiftLM
-          file .build/release/SwiftLM
+          git rev-parse HEAD > "$RUNNER_TEMP/lmd-swiftlm.sha"
+          printf '%s\n' "$SWIFTLM_REF" > "$RUNNER_TEMP/lmd-expected-swiftlm.sha"
+          cmp "$RUNNER_TEMP/lmd-expected-swiftlm.sha" "$RUNNER_TEMP/lmd-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/lmd-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/lmd-library.sha"
+          read -r swiftlm_ref < "$RUNNER_TEMP/lmd-swiftlm.sha"
+          read -r core_ref < "$RUNNER_TEMP/lmd-core.sha"
+          read -r library_ref < "$RUNNER_TEMP/lmd-library.sha"
+          for ref in "$swiftlm_ref" "$core_ref" "$library_ref"; do
+            if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::The selected SwiftLM source and gitlinks must use full commit SHAs."
+              exit 1
+            fi
+          done
+          {
+            echo "swiftlm_ref=$swiftlm_ref"
+            echo "core_ref=$core_ref"
+            echo "library_ref=$library_ref"
+          } >> "$GITHUB_OUTPUT"
+          git ls-tree HEAD -- mlx-swift mlx-swift-lm
 
-      - name: TurboQuant unit tests
+  lmd_consumer:
+    name: LMD consumer
+    needs: lmd_sources
+    uses: agoodkind/lmd/.github/workflows/lmd_integration.yml@939d18d8115767be6e2938d8f3fa96616613ba60
+    with:
+      lmd_ref: 939d18d8115767be6e2938d8f3fa96616613ba60
+      core_ref: ${{ needs.lmd_sources.outputs.core_ref }}
+      library_ref: ${{ needs.lmd_sources.outputs.library_ref }}
+      swiftlm_ref: ${{ needs.lmd_sources.outputs.swiftlm_ref }}
+      core_profile: ${{ needs.lmd_sources.outputs.core_ref == '786724757aa480f049d3a913c59da7e0e61ad5dc' && 'core-runtime-7867247' || '' }}
+      library_profile: ${{ needs.lmd_sources.outputs.library_ref == '60054f77f91bc3e77c44950054dd6a9b53359352' && 'library-runtime-60054f7' || '' }}
+    secrets:
+      LOCAL_POOL_CAPACITY_TOKEN: ${{ secrets.LOCAL_POOL_CAPACITY_TOKEN }}
+
+  lmd_integration:
+    name: LMD Integration
+    if: ${{ always() }}
+    needs: [lmd_sources, lmd_consumer]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful LMD validation
+        env:
+          SOURCES_RESULT: ${{ needs.lmd_sources.result }}
+          CONSUMER_RESULT: ${{ needs.lmd_consumer.result }}
         run: |
-          clang++ -std=c++17 -O2 -o /tmp/tq_test tests/test_turbo_quant.cpp
-          /tmp/tq_test
+          if [[ "$SOURCES_RESULT" != success ]]; then
+            echo "::error::LMD source selection did not succeed: $SOURCES_RESULT"
+            exit 1
+          fi
+          if [[ "$CONSUMER_RESULT" != success ]]; then
+            echo "::error::LMD consumer validation did not succeed: $CONSUMER_RESULT"
+            exit 1
+          fi
 
-      - name: Build Test Harness
-        run: swift build --build-tests
-
-      - name: Install MLX Metal library
-        run: |
-          python3 -m venv /tmp/mlx_venv
-          /tmp/mlx_venv/bin/pip install --quiet mlx
-          cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib .build/release/
-          find .build -type d -name "MacOS" -exec cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib {}/ \;
-
-      - name: SwiftBuddy Tests (MemPalace & Lifecycle)
-        run: swift test --skip-build --filter SwiftBuddyTests --disable-swift-testing
-
-      - name: SwiftLM Server Tests (Streaming & SSE)
-        run: swift test --skip-build --filter SwiftLMTests --disable-swift-testing
-
-      - name: Upload Binary Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: swiftlm-architecture
-          path: .build/release/
-          retention-days: 1
-
-  integration_matrix:
-    needs: build_and_unit_test
-    runs-on: macos-15
-    timeout-minutes: 30
-    continue-on-error: ${{ matrix.modality == 'opencode' }}
+  build_and_unit_test:
+    name: Native ${{ matrix.configuration }} build and tests
+    needs: select_macos_runner
+    if: ${{ !cancelled() }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        modality: [server, vision, audio, graph, omni, opencode]
+        configuration: [debug, release]
+    env:
+      CONFIGURATION: ${{ matrix.configuration }}
+      SWIFTBUDDY_LOCAL_CLASSES: >-
+        AudioExtractionTests AudioFusionTests AudioTTSTests ChatToolsTests
+        ContextWindowCalculationTests ExtractionServiceTests GraphPalaceTests
+        LocalModelDirectoryTests MemoryPalaceServiceTests ModelArchitectureProbeTests
+        ModelLifecycleTests ModelStorageCacheTests ModelStorageLayoutTests
+        ProjectMinerTests Tier6AdvancedTests VLMExtractionTests VLMProcessorTests VLMRegistryTests
     steps:
+      - name: Require successful macOS prerequisites
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          SELECTOR_RESULT: ${{ needs.select_macos_runner.result }}
+          SELECTED_RUNNER: ${{ needs.select_macos_runner.outputs.label }}
+        run: |
+          if [[ "$SELECTOR_RESULT" != 'success' || -z "$SELECTED_RUNNER" ]]; then
+            echo "::error::The macOS runner selector did not succeed or did not return a runner label."
+            exit 1
+          fi
+
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.SWIFTLM_REF }}
           submodules: recursive
-      
-      - name: Download Binary Artifact
+          persist-credentials: false
+
+      - name: Verify the checked out source revisions
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/library.sha"
+          git -C mlx-swift rev-parse HEAD > "$RUNNER_TEMP/actual-core.sha"
+          git -C mlx-swift-lm rev-parse HEAD > "$RUNNER_TEMP/actual-library.sha"
+          cmp "$RUNNER_TEMP/core.sha" "$RUNNER_TEMP/actual-core.sha"
+          cmp "$RUNNER_TEMP/library.sha" "$RUNNER_TEMP/actual-library.sha"
+          git submodule status --recursive > "$RUNNER_TEMP/cohort-sources.txt"
+          cat "$RUNNER_TEMP/cohort-sources.txt" >> "$GITHUB_STEP_SUMMARY"
+          swift --version
+          xcodebuild -version
+
+      - name: Set up Swift result verification
+        id: maintenance
+        uses: agoodkind/lmd/.github/actions/setup-maintenance@ec18740170edb9c5c2216a9c6fe2789c3d9926b4
+        with:
+          ref: '2812aa0d79c00cda8185e11182e98ddea59eb6be'
+
+      - name: Cache dependency source
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build/repositories
+            .build/checkouts
+          key: ${{ runner.os }}-swiftlm-source-${{ hashFiles('Package.resolved') }}
+
+      - name: Build the native executable and test harness
+        run: |
+          swift package resolve
+          git diff --exit-code -- Package.resolved
+          swift build --build-system native --jobs 4 -c "$CONFIGURATION" -Xswiftc -enable-testing --build-tests
+          swift build --build-system native --jobs 4 -c "$CONFIGURATION" -Xswiftc -enable-testing --show-bin-path > "$RUNNER_TEMP/bin-dir.txt"
+          read -r SWIFTLM_BIN_DIR < "$RUNNER_TEMP/bin-dir.txt"
+          test -x "$SWIFTLM_BIN_DIR/SwiftLM"
+          echo "SWIFTLM_BIN_DIR=$SWIFTLM_BIN_DIR" >> "$GITHUB_ENV"
+
+      - name: Build source matched Metal and NAX libraries
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+          mkdir -p "$RUNNER_TEMP/mlx-metal/lib" "$RUNNER_TEMP/mlx-nax/lib"
+          # The base library supports the package minimum. NAX requires macOS 26.2.
+          cmake -S mlx-swift/Source/Cmlx/mlx -B "$RUNNER_TEMP/mlx-metal" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DMLX_METAL_JIT=OFF -DMLX_BUILD_TESTS=OFF -DMLX_BUILD_EXAMPLES=OFF \
+            -DMLX_BUILD_BENCHMARKS=OFF -DMLX_BUILD_PYTHON_BINDINGS=OFF \
+            -DMLX_METAL_PATH="$RUNNER_TEMP/mlx-metal/lib"
+          cmake --build "$RUNNER_TEMP/mlx-metal" --target mlx-metallib --parallel 4
+          cmake -S mlx-swift/Source/Cmlx/mlx -B "$RUNNER_TEMP/mlx-nax" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=26.2 \
+            -DMLX_METAL_JIT=OFF -DMLX_BUILD_TESTS=OFF -DMLX_BUILD_EXAMPLES=OFF \
+            -DMLX_BUILD_BENCHMARKS=OFF -DMLX_BUILD_PYTHON_BINDINGS=OFF \
+            -DMLX_METAL_PATH="$RUNNER_TEMP/mlx-nax/lib"
+          cmake --build "$RUNNER_TEMP/mlx-nax" --target mlx-metallib --parallel 4
+          mkdir -p "$RUNNER_TEMP/mlx-metal/nax"
+          for kernel in steel_gemm_fused_nax steel_gemm_splitk_nax steel_gemm_gather_nax steel_gemm_segmented_nax steel_attention_nax quantized_nax fp_quantized_nax; do
+            air="$RUNNER_TEMP/mlx-nax/mlx/backend/metal/kernels/$kernel.air"
+            test -f "$air"
+            xcrun -sdk macosx metal -mmacosx-version-min=26.2 "$air" \
+              -o "$RUNNER_TEMP/mlx-metal/nax/$kernel.metallib"
+          done
+
+      - name: Install the source matched shaders beside the executables
+        run: |
+          cp "$RUNNER_TEMP/mlx-metal/lib/mlx.metallib" "$SWIFTLM_BIN_DIR/mlx.metallib"
+          cp -R "$RUNNER_TEMP/mlx-metal/nax" "$SWIFTLM_BIN_DIR/nax"
+          for test_bundle in "$SWIFTLM_BIN_DIR"/*.xctest; do
+            test -d "$test_bundle/Contents/MacOS"
+            cp "$RUNNER_TEMP/mlx-metal/lib/mlx.metallib" "$test_bundle/Contents/MacOS/mlx.metallib"
+            cp -R "$RUNNER_TEMP/mlx-metal/nax" "$test_bundle/Contents/MacOS/nax"
+          done
+
+      - name: Run the TurboQuant unit tests
+        run: |
+          clang++ -std=c++17 -O2 -o "$RUNNER_TEMP/tq_test" tests/test_turbo_quant.cpp
+          "$RUNNER_TEMP/tq_test"
+
+      - name: Discover the actual XCTest cases
+        run: |
+          if swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
+            -Xswiftc -enable-testing --disable-swift-testing list --skip-build > "$RUNNER_TEMP/swiftlm-discovery.txt" 2> "$RUNNER_TEMP/swiftlm-discovery-errors.txt"; then
+            cat "$RUNNER_TEMP/swiftlm-discovery-errors.txt"
+            cat "$RUNNER_TEMP/swiftlm-discovery.txt"
+          else
+            status=$?
+            cat "$RUNNER_TEMP/swiftlm-discovery-errors.txt"
+            exit "$status"
+          fi
+
+      - name: Run all model free SwiftLM tests and the real HTTP regressions
+        run: |
+          set -o pipefail
+          swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
+            -Xswiftc -enable-testing --disable-swift-testing --skip-build --filter SwiftLMTests \
+            2>&1 | tee "$RUNNER_TEMP/swiftlm-runtime.log"
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results swiftpm \
+            "$RUNNER_TEMP/swiftlm-runtime.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
+            SwiftLMTests OwnFeatureHTTPTests
+
+      - name: Run SwiftBuddy tests with local data
+        env:
+          HF_HOME: ${{ runner.temp }}/swiftbuddy-model-loading-harness
+          HF_HUB_CACHE: ${{ runner.temp }}/swiftbuddy-model-loading-harness/hub
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
+        run: |
+          set -o pipefail
+          read -r -a test_classes <<< "$SWIFTBUDDY_LOCAL_CLASSES"
+          printf -v class_pattern '%s|' "${test_classes[@]}"
+          class_pattern="${class_pattern%|}"
+          swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
+            -Xswiftc -enable-testing --disable-swift-testing --skip-build \
+            --filter "SwiftBuddyTests\.($class_pattern)" \
+            2>&1 | tee "$RUNNER_TEMP/swiftbuddy-local.log"
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results swiftpm \
+            "$RUNNER_TEMP/swiftbuddy-local.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
+            "${test_classes[@]}"
+
+      - name: Run manual SwiftBuddy model and network tests
+        if: github.event_name == 'workflow_dispatch' && inputs.run_pretrained_smoke && matrix.configuration == 'release'
+        run: |
+          set -o pipefail
+          swift test --build-system native --jobs 4 -c "$CONFIGURATION" \
+            -Xswiftc -enable-testing --disable-swift-testing --skip-build \
+            --filter 'SwiftBuddyTests\.(AudioSTTTests|AudioTests|E2EIntegrationTests|HFModelSearchTests|VLMTests)' \
+            2>&1 | tee "$RUNNER_TEMP/swiftbuddy-manual.log"
+          "${{ steps.maintenance.outputs.binary }}" verify-test-results swiftpm \
+            "$RUNNER_TEMP/swiftbuddy-manual.log" "$RUNNER_TEMP/swiftlm-discovery.txt" \
+            AudioSTTTests AudioTests E2EIntegrationTests HFModelSearchTests VLMTests
+
+      - name: Prepare the tested executable artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/swiftlm-artifact"
+          cp "$SWIFTLM_BIN_DIR/SwiftLM" "$SWIFTLM_BIN_DIR/SwiftBuddy" "$SWIFTLM_BIN_DIR/mlx.metallib" "$RUNNER_TEMP/swiftlm-artifact/"
+          cp -R "$SWIFTLM_BIN_DIR/nax" "$RUNNER_TEMP/swiftlm-artifact/nax"
+          shopt -s nullglob
+          for bundle in "$SWIFTLM_BIN_DIR"/*.bundle; do
+            cp -R "$bundle" "$RUNNER_TEMP/swiftlm-artifact/"
+          done
+          cp "$RUNNER_TEMP/swiftlm.sha" "$RUNNER_TEMP/core.sha" "$RUNNER_TEMP/library.sha" "$RUNNER_TEMP/cohort-sources.txt" "$RUNNER_TEMP/swiftlm-artifact/"
+          cp Package.resolved "$RUNNER_TEMP/swiftlm-artifact/Package.resolved"
+          cd "$RUNNER_TEMP/swiftlm-artifact"
+          find . -type f -exec shasum -a 256 {} + > "$RUNNER_TEMP/swiftlm-checksums.txt"
+          mv "$RUNNER_TEMP/swiftlm-checksums.txt" SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Upload the tested executable and shaders
+        uses: actions/upload-artifact@v4
+        with:
+          name: swiftlm-native-${{ matrix.configuration }}
+          path: ${{ runner.temp }}/swiftlm-artifact/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload discovery and completed test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swiftlm-results-${{ matrix.configuration }}
+          path: |
+            ${{ runner.temp }}/cohort-sources.txt
+            ${{ runner.temp }}/swiftlm-discovery.txt
+            ${{ runner.temp }}/swiftlm-discovery-errors.txt
+            ${{ runner.temp }}/swiftlm-runtime.log
+            ${{ runner.temp }}/swiftbuddy-local.log
+            ${{ runner.temp }}/swiftbuddy-manual.log
+          if-no-files-found: error
+          retention-days: 14
+
+  local_fixtures:
+    name: Local checkpoint E2E tests
+    needs: [build_and_unit_test, select_macos_runner]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - name: Require successful macOS prerequisites
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          SELECTOR_RESULT: ${{ needs.select_macos_runner.result }}
+          SELECTED_RUNNER: ${{ needs.select_macos_runner.outputs.label }}
+          NATIVE_BUILD_RESULT: ${{ needs.build_and_unit_test.result }}
+        run: |
+          if [[ "$SELECTOR_RESULT" != 'success' || -z "$SELECTED_RUNNER" ]]; then
+            echo "::error::The macOS runner selector did not succeed or did not return a runner label."
+            exit 1
+          fi
+          if [[ "$NATIVE_BUILD_RESULT" != 'success' ]]; then
+            echo "::error::The required native build and tests did not succeed."
+            exit 1
+          fi
+
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SWIFTLM_REF }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Download the tested Release executable and shaders
         uses: actions/download-artifact@v4
         with:
-          name: swiftlm-architecture
+          name: swiftlm-native-release
           path: .build/release/
-          
-      - name: Restore Architecture Privileges
-        run: chmod +x .build/release/SwiftLM
 
-      - name: Cache MLX model
+      - name: Verify the tested source and shader artifact
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
+
+      - name: Run every committed tiny checkpoint
+        run: |
+          set -o pipefail
+          bash tests/test-fixtures.sh "$GITHUB_WORKSPACE/.build/release/SwiftLM" 15460 \
+            2>&1 | tee "$RUNNER_TEMP/swiftlm-fixtures.log"
+          grep -F 'Results: 7 passed, 0 failed' "$RUNNER_TEMP/swiftlm-fixtures.log"
+
+      - name: Upload checkpoint test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swiftlm-local-fixtures
+          path: |
+            ${{ runner.temp }}/swiftlm-fixtures.log
+            /tmp/SwiftLM-test-fixture-*.log
+          if-no-files-found: error
+          retention-days: 14
+
+  integration_matrix:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_pretrained_smoke }}
+    needs: [build_and_unit_test, select_macos_runner]
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # `models` is prefetched before the test runs. Without it the SwiftLM server
+        # downloads the model itself inside the test's 180 s startup window, which the
+        # 4.9 GB gemma-4 builds cannot make (audio/omni/opencode). Keep in sync with the
+        # model each tests/test-<modality>.sh actually loads.
+        include:
+          - modality: server
+            models: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+          # Same smoke test, KV-shared Gemma 4. e2b ships k_proj/v_proj for its shared
+          # layers while e4b omits them, so it exercises a weight layout no other job
+          # covers — a regression that broke it entirely still passed CI and shipped.
+          - modality: server
+            name_suffix: -gemma-e2b
+            models: mlx-community/gemma-4-e2b-it-4bit
+            test_model: mlx-community/gemma-4-e2b-it-4bit
+          # LFM2.5 used to be absent here and was fetched by the server mid-test, which
+          # is how it silently picked up a republished revision whose chat template was
+          # one brace short of valid and took main red. Prefetching it at a pinned
+          # revision is what makes this job depend on our code rather than on what
+          # upstream published that afternoon.
+          - modality: vision
+            models: mlx-community/Qwen2-VL-2B-Instruct-4bit LiquidAI/LFM2.5-VL-450M-MLX-4bit@10ce3604e42cd595497c47aaf67b7890e1e2a3b4
+          - modality: audio
+            models: mlx-community/gemma-4-e4b-it-4bit
+          # OpenAI-compatibility contract: what the client receives over the wire, once
+          # real tokenisation decides chunk boundaries. Runs on the smallest model —
+          # these assert server behaviour, not model quality (issue #128).
+          - modality: contract
+            models: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+          # Hybrid (recurrent + attention) prompt cache. A prompt that diverges from a
+          # cached one resumes from a recurrent-state checkpoint instead of re-prefilling
+          # from zero; the unit suite only checks that bookkeeping against synthetic
+          # caches, so this job is what holds the end-to-end claim that a checkpoint
+          # resume computes the same thing as a full prefill. Qwen3.5 is the hybrid
+          # architecture under test, and the 0.8B build keeps the download small.
+          - modality: hybrid-cache
+            models: mlx-community/Qwen3.5-0.8B-MLX-4bit
+            test_model: mlx-community/Qwen3.5-0.8B-MLX-4bit
+          - modality: omni
+            models: mlx-community/gemma-4-e4b-it-4bit
+          # No longer continue-on-error: Test 2 used to shell out to the opencode npm
+          # CLI, which the runner OOM-killed after the server had already answered
+          # correctly. It now issues the request shape opencode sends, so a failure here
+          # means SwiftLM misbehaved and should block.
+          - modality: opencode
+            models: mlx-community/gemma-4-e4b-it-4bit
+    steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SWIFTLM_REF }}
+          submodules: recursive
+      
+      - name: Download the tested Release executable and shaders
+        uses: actions/download-artifact@v4
+        with:
+          name: swiftlm-native-release
+          path: .build/release/
+
+      - name: Verify the tested source and shader artifact
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
+
+      # The key is per-modality and derived from the test script, so changing the model a
+      # test loads rotates the key automatically. The previous static
+      # `mlx-model-qwen2.5-0.5b-4bit` key could never be re-saved once created
+      # (actions/cache does not overwrite an existing key), so the gemma-4 modalities kept
+      # restoring a cache that had never contained their model.
+      - name: Cache MLX models (${{ matrix.modality }})
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-model-qwen2.5-0.5b-4bit
-          
-      - name: Run E2E tests (${{ matrix.modality }})
+          key: hf-models-v2-${{ matrix.modality }}${{ matrix.name_suffix }}-${{ hashFiles(format('tests/test-{0}.sh', matrix.modality)) }}
+          restore-keys: |
+            hf-models-v2-${{ matrix.modality }}${{ matrix.name_suffix }}-
+
+      - name: Set up HuggingFace CLI
+        if: matrix.models != ''
+        run: |
+          python3 -m venv /tmp/hf_venv
+          /tmp/hf_venv/bin/pip install --quiet huggingface_hub hf
+
+      - name: Pre-download models (${{ matrix.modality }})
+        if: matrix.models != ''
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
+        run: |
+          source /tmp/hf_venv/bin/activate
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh ${{ matrix.models }}
+
+      - name: Run E2E tests (${{ matrix.modality }}${{ matrix.name_suffix }})
         env:
           HF_HUB_DOWNLOAD_TIMEOUT: "600"
+          SWIFTLM_TEST_MODEL: ${{ matrix.test_model }}
+          # Diagnostic: print a Swift backtrace when the server dies with a signal.
+          SWIFT_BACKTRACE: "enable=yes,interactive=no"
         run: |
           chmod +x tests/test-${{ matrix.modality }}.sh
           for attempt in 1 2 3; do
             echo "Attempt $attempt of 3..."
+            # Diagnostic: collect the SwiftLM crash report from every attempt, not only when the
+            # job fails, because the job retries and a crash in attempt 1 is otherwise invisible.
+            touch "$RUNNER_TEMP/attempt-$attempt"
             if tests/test-${{ matrix.modality }}.sh .build/release/SwiftLM 15413; then exit 0; fi
+            # ReportCrash writes the report a moment after the server dies, so wait before looking.
+            sleep 10
+            reports=$(find "$HOME/Library/Logs/DiagnosticReports" -name '*SwiftLM*' -newer "$RUNNER_TEMP/attempt-$attempt" 2>/dev/null || true)
+            if [ -z "$reports" ]; then echo "no new SwiftLM crash report for attempt $attempt"; fi
+            for f in $reports; do
+              echo "===== crash report, attempt $attempt: $f"
+              head -c 60000 "$f"
+            done
             if [ "$attempt" -eq 3 ]; then echo "All attempts failed"; exit 1; fi
             sleep 10
           done
@@ -121,61 +588,52 @@ jobs:
           path: /tmp/SwiftLM-test-*.log
           retention-days: 7
 
-  # ── Speculative Decoding E2E (dual-model: 0.8B draft + 4B main) ──
-  # Uses the standard macos-15 runner (7 GB RAM). 
-  # We test the 4B main model which safely fits within memory.
   speculative-decoding:
-    runs-on: macos-15
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_speculative_smoke }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 45
-    needs: build_and_unit_test  # Run in parallel with integration_matrix
+    needs: [build_and_unit_test, select_macos_runner]  # Run in parallel with integration_matrix
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.SWIFTLM_REF }}
           submodules: recursive
 
-      - name: Install Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain || true
-
-      - name: Cache Swift packages
-        uses: actions/cache@v4
+      - name: Download the tested Release executable and shaders
+        uses: actions/download-artifact@v4
         with:
-          path: .build
-          key: ${{ runner.os }}-spm-SwiftLM-v3-${{ hashFiles('Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-SwiftLM-v3-
+          name: swiftlm-native-release
+          path: .build/release/
 
-      - name: Clear stale module cache
-        run: find .build -type d -name ModuleCache -exec rm -rf {} + 2>/dev/null || true
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build (Release)
-        run: swift build -c release
-
-      - name: Compile and install custom MLX Metal library
+      - name: Verify the tested source and shader artifact
         run: |
-          # cmake-based build from SharpAI fork — mirrors build.sh (PR #58)
-          if [ -d "mlx-swift/Source/Cmlx/mlx" ]; then
-            MLX_SRC="mlx-swift/Source/Cmlx/mlx"
-          else
-            MLX_SRC=".build/checkouts/mlx-swift/Source/Cmlx/mlx"
-          fi
-          mkdir -p .build/metallib_build
-          pushd .build/metallib_build
-          cmake "../../$MLX_SRC" \
-            -DMLX_BUILD_TESTS=OFF \
-            -DMLX_BUILD_EXAMPLES=OFF \
-            -DMLX_BUILD_BENCHMARKS=OFF \
-            -DMLX_BUILD_PYTHON_BINDINGS=OFF \
-            -DMLX_METAL_JIT=OFF \
-            -DMLX_ENABLE_NAX=1 \
-            -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -20
-          make mlx-metallib -j$(sysctl -n hw.ncpu) 2>&1 | tail -20
-          popd
-          BUILT=$(find .build/metallib_build -name "mlx.metallib" | head -1)
-          cp "$BUILT" .build/release/mlx.metallib
-          # Install hf for model pre-download
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
+
+      - name: Set up the model download tools
+        run: |
           python3 -m venv /tmp/mlx_venv
           /tmp/mlx_venv/bin/pip install --quiet huggingface_hub hf
 
@@ -183,13 +641,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-speculative-qwen35-2b-0.8b
+          key: mlx-speculative-qwen35-2b-0.8b-v2
 
       - name: Pre-download HuggingFace models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-2B-4bit || true
-          hf download mlx-community/Qwen3.5-0.8B-MLX-4bit || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-2B-4bit \
+            mlx-community/Qwen3.5-0.8B-MLX-4bit
 
       - name: Run speculative decoding E2E
         env:
@@ -218,58 +680,52 @@ jobs:
           path: /tmp/SwiftLM-test-speculative.log
           retention-days: 7
 
-  # ── DFlash Speculative Decoding E2E ──
-  # Uses the standard macos-15 runner (7 GB RAM). 
   dflash-speculative-decoding:
-    runs-on: macos-15
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_speculative_smoke }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 45
-    needs: build_and_unit_test
+    needs: [build_and_unit_test, select_macos_runner]
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.SWIFTLM_REF }}
           submodules: recursive
 
-      - name: Install Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain || true
-
-      - name: Cache Swift packages
-        uses: actions/cache@v4
+      - name: Download the tested Release executable and shaders
+        uses: actions/download-artifact@v4
         with:
-          path: .build
-          key: ${{ runner.os }}-spm-SwiftLM-v3-${{ hashFiles('Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-SwiftLM-v3-
+          name: swiftlm-native-release
+          path: .build/release/
 
-      - name: Clear stale module cache
-        run: find .build -type d -name ModuleCache -exec rm -rf {} + 2>/dev/null || true
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build (Release)
-        run: swift build -c release
-
-      - name: Compile and install custom MLX Metal library
+      - name: Verify the tested source and shader artifact
         run: |
-          if [ -d "mlx-swift/Source/Cmlx/mlx" ]; then
-            MLX_SRC="mlx-swift/Source/Cmlx/mlx"
-          else
-            MLX_SRC=".build/checkouts/mlx-swift/Source/Cmlx/mlx"
-          fi
-          mkdir -p .build/metallib_build
-          pushd .build/metallib_build
-          cmake "../../$MLX_SRC" \
-            -DMLX_BUILD_TESTS=OFF \
-            -DMLX_BUILD_EXAMPLES=OFF \
-            -DMLX_BUILD_BENCHMARKS=OFF \
-            -DMLX_BUILD_PYTHON_BINDINGS=OFF \
-            -DMLX_METAL_JIT=OFF \
-            -DMLX_ENABLE_NAX=1 \
-            -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -20
-          make mlx-metallib -j$(sysctl -n hw.ncpu) 2>&1 | tail -20
-          popd
-          BUILT=$(find .build/metallib_build -name "mlx.metallib" | head -1)
-          cp "$BUILT" .build/release/mlx.metallib
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
+
+      - name: Set up the model download tools
+        run: |
           python3 -m venv /tmp/mlx_venv
           /tmp/mlx_venv/bin/pip install --quiet huggingface_hub hf
 
@@ -277,13 +733,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-dflash-qwen35-4b
+          key: mlx-dflash-qwen35-4b-v2
 
       - name: Pre-download HuggingFace models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-4B-4bit || true
-          hf download z-lab/Qwen3.5-4B-DFlash || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-4B-4bit \
+            z-lab/Qwen3.5-4B-DFlash
 
       - name: Run DFlash E2E
         env:
@@ -311,62 +771,55 @@ jobs:
           path: /tmp/SwiftLM-test-dflash.log
           retention-days: 7
 
-  # ── Speculative Decoding Memory Evaluation ──
   # Runs the 2B model with NUM_DRAFT_TOKENS=2 to check peak
   # memory compression/efficiency. Emits vm_stat readings as step summary.
   speculative-decoding-eval:
-    runs-on: macos-15
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_speculative_eval }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 45
-    needs: build_and_unit_test
+    needs: [build_and_unit_test, select_macos_runner]
     continue-on-error: true
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.SWIFTLM_REF }}
           submodules: recursive
-      
-      - name: Install Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain || true
 
-      - name: Cache Swift packages
-        uses: actions/cache@v4
+      - name: Download the tested Release executable and shaders
+        uses: actions/download-artifact@v4
         with:
-          path: .build
-          key: ${{ runner.os }}-spm-SwiftLM-v3-${{ hashFiles('Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-SwiftLM-v3-
+          name: swiftlm-native-release
+          path: .build/release/
 
-      - name: Clear stale module cache
-        run: find .build -type d -name ModuleCache -exec rm -rf {} + 2>/dev/null || true
-
-      - name: Resolve dependencies
-        run: swift package resolve
-
-      - name: Build (Release)
-        run: swift build -c release
-      
-      - name: Compile and install custom MLX Metal library
+      - name: Verify the tested source and shader artifact
         run: |
-          # cmake-based build from SharpAI fork — mirrors build.sh (PR #58)
-          if [ -d "mlx-swift/Source/Cmlx/mlx" ]; then
-            MLX_SRC="mlx-swift/Source/Cmlx/mlx"
-          else
-            MLX_SRC=".build/checkouts/mlx-swift/Source/Cmlx/mlx"
-          fi
-          mkdir -p .build/metallib_build
-          pushd .build/metallib_build
-          cmake "../../$MLX_SRC" \
-            -DMLX_BUILD_TESTS=OFF \
-            -DMLX_BUILD_EXAMPLES=OFF \
-            -DMLX_BUILD_BENCHMARKS=OFF \
-            -DMLX_BUILD_PYTHON_BINDINGS=OFF \
-            -DMLX_METAL_JIT=OFF \
-            -DMLX_ENABLE_NAX=1 \
-            -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -20
-          make mlx-metallib -j$(sysctl -n hw.ncpu) 2>&1 | tail -20
-          popd
-          BUILT=$(find .build/metallib_build -name "mlx.metallib" | head -1)
-          cp "$BUILT" .build/release/mlx.metallib
-          # Install hf for model pre-download
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
+
+      - name: Set up the model download tools
+        run: |
           python3 -m venv /tmp/mlx_venv
           /tmp/mlx_venv/bin/pip install --quiet huggingface_hub hf
 
@@ -374,13 +827,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-speculative-eval-qwen35-2b-0.8b
+          key: mlx-speculative-eval-qwen35-2b-0.8b-v2
 
       - name: Pre-download HuggingFace models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-2B-4bit || true
-          hf download mlx-community/Qwen3.5-0.8B-MLX-4bit || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-2B-4bit \
+            mlx-community/Qwen3.5-0.8B-MLX-4bit
 
       - name: Snapshot RAM before test
         id: ram_before
@@ -392,7 +849,7 @@ jobs:
             /Pages occupied by compressor:/ { v=$5; gsub(/\./, "", v); comp=v+0 }
             END { printf "%.2f", (act+wire+comp)*page_size/1073741824 }
           ')
-          echo "ram_before=$RAM" >> $GITHUB_OUTPUT
+          echo "ram_before=$RAM" >> "$GITHUB_OUTPUT"
           echo "RAM before eval: ${RAM} GB"
       
       - name: Run speculative evaluation E2E
@@ -427,7 +884,7 @@ jobs:
             /Pages occupied by compressor:/ { v=$5; gsub(/\./, "", v); comp=v+0 }
             END { printf "%.2f", (act+wire+comp)*page_size/1073741824 }
           ')
-          echo "ram_after=$RAM" >> $GITHUB_OUTPUT
+          echo "ram_after=$RAM" >> "$GITHUB_OUTPUT"
           echo "RAM after eval: ${RAM} GB"
 
       - name: Emit memory summary
@@ -444,7 +901,7 @@ jobs:
             echo "| RAM before test | ${BEFORE} GB |"
             echo "| RAM after test  | ${AFTER} GB |"
             echo "| Delta | $(echo "$AFTER $BEFORE" | awk '{printf "%.2f", $1-$2}') GB |"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload speculative eval logs on failure
         if: failure()
@@ -453,55 +910,70 @@ jobs:
           name: speculative-eval-logs
           path: /tmp/SwiftLM-test-speculative-eval.log
 
-  # ── Issue #72 Regression: SSD streaming + draft model RAM guard ──────────────
-  # Mandatory (not continue-on-error). Enforces the auto-cap-to-1 fix and the
-  # memoryLimit sentinel on every PR. Uses tiny models (2B main + 0.8B draft)
-  # sized for the 7 GB macos-15 runner.
-  #
-  # Three checks mirror the local Test 10 in run_benchmark.sh:
-  #   [1] Auto-cap warning present in server log
-  #   [2] Peak RAM ≤ 85% of runner physical RAM during inference
-  #   [3] /v1/chat/completions returns valid content
   ssd-draft-memory-guard:
-    runs-on: macos-15
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_ssd_draft_guard }}
+    runs-on: ${{ needs.select_macos_runner.outputs.label || 'ubuntu-latest' }}
     timeout-minutes: 45
-    needs: build_and_unit_test
+    needs: [build_and_unit_test, select_macos_runner]
     steps:
+      - name: Align Xcode and the runtime CPU compiler
+        run: |
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          env -u DEVELOPER_DIR xcode-select --print-path > "$RUNNER_TEMP/selected-xcode.txt"
+          printf '%s\n' "$DEVELOPER_DIR" > "$RUNNER_TEMP/expected-xcode.txt"
+          cmp "$RUNNER_TEMP/expected-xcode.txt" "$RUNNER_TEMP/selected-xcode.txt"
+          xcrun --kill-cache
+          xcrun --sdk macosx --show-sdk-path > "$RUNNER_TEMP/sdk-path.txt"
+          read -r SDKROOT < "$RUNNER_TEMP/sdk-path.txt"
+          echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find clang++
+          g++ --version
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.SWIFTLM_REF }}
           submodules: recursive
 
-      - name: Download Binary Artifact
+      - name: Download the tested Release executable and shaders
         uses: actions/download-artifact@v4
-        continue-on-error: true   # fall back to building if artifact expired
         with:
-          name: swiftlm-architecture
+          name: swiftlm-native-release
           path: .build/release/
 
-      - name: Build (Release) if artifact missing
+      - name: Verify the tested source and shader artifact
         run: |
-          if [ ! -f ".build/release/SwiftLM" ]; then
-            swift build -c release
-          fi
-          chmod +x .build/release/SwiftLM
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
 
-      - name: Install MLX Metal library
+      - name: Set up the model download tools
         run: |
           python3 -m venv /tmp/mlx_venv
-          /tmp/mlx_venv/bin/pip install --quiet mlx huggingface_hub hf
-          cp /tmp/mlx_venv/lib/python*/site-packages/mlx/lib/mlx.metallib .build/release/
+          /tmp/mlx_venv/bin/pip install --quiet huggingface_hub hf
 
       - name: Cache MLX models (2B main + 0.8B draft)
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: mlx-ssd-draft-guard-qwen35-2b-0.8b
+          key: mlx-ssd-draft-guard-qwen35-2b-0.8b-v2
 
       - name: Pre-download models
+        env:
+          HF_HUB_DOWNLOAD_TIMEOUT: "60"
         run: |
           source /tmp/mlx_venv/bin/activate
-          hf download mlx-community/Qwen3.5-2B-4bit || true
-          hf download mlx-community/Qwen3.5-0.8B-MLX-4bit || true
+          chmod +x scripts/ci-download-models.sh
+          scripts/ci-download-models.sh \
+            mlx-community/Qwen3.5-2B-4bit \
+            mlx-community/Qwen3.5-0.8B-MLX-4bit
 
       - name: Snapshot RAM baseline
         id: ram_base
@@ -515,9 +987,11 @@ jobs:
           ')
           TOTAL=$(sysctl -n hw.memsize | awk '{printf "%.0f", $1/1073741824}')
           LIMIT=$(echo "$TOTAL * 0.85" | bc | cut -d. -f1)
-          echo "ram_base=$RAM"      >> $GITHUB_OUTPUT
-          echo "runner_ram=$TOTAL"  >> $GITHUB_OUTPUT
-          echo "ram_limit=$LIMIT"   >> $GITHUB_OUTPUT
+          {
+            echo "ram_base=$RAM"
+            echo "runner_ram=$TOTAL"
+            echo "ram_limit=$LIMIT"
+          } >> "$GITHUB_OUTPUT"
           echo "Baseline RAM: ${RAM} GB  |  Runner: ${TOTAL} GB  |  Limit: ${LIMIT} GB"
 
       - name: Start SSD + draft server (Issue #72 scenario)
@@ -534,11 +1008,11 @@ jobs:
             --max-tokens 64 \
             > /tmp/ssd_draft_guard.log 2>&1 &
           PID=$!
-          echo "server_pid=$PID" >> $GITHUB_OUTPUT
+          echo "server_pid=$PID" >> "$GITHUB_OUTPUT"
 
           echo "Waiting for server (up to 300s)..."
           for i in $(seq 1 300); do
-            if ! kill -0 $PID 2>/dev/null; then
+            if ! kill -0 "$PID" 2>/dev/null; then
               echo "Server died early:"
               cat /tmp/ssd_draft_guard.log
               exit 1
@@ -561,7 +1035,7 @@ jobs:
             /Pages occupied by compressor:/ { v=$5; gsub(/\./, "", v); comp=v+0 }
             END { printf "%.2f", (act+wire+comp)*page_size/1073741824 }
           ')
-          echo "ram_loaded=$RAM" >> $GITHUB_OUTPUT
+          echo "ram_loaded=$RAM" >> "$GITHUB_OUTPUT"
           echo "RAM after load: ${RAM} GB"
 
       - name: "[1/3] Verify draft model loaded in server log"
@@ -595,7 +1069,7 @@ jobs:
             /Pages occupied by compressor:/ { v=$5; gsub(/\./, "", v); comp=v+0 }
             END { printf "%.2f", (act+wire+comp)*page_size/1073741824 }
           ')
-          echo "ram_peak=$RAM" >> $GITHUB_OUTPUT
+          echo "ram_peak=$RAM" >> "$GITHUB_OUTPUT"
           echo "RAM after inference: ${RAM} GB"
 
           LIMIT="${{ steps.ram_base.outputs.ram_limit }}"
@@ -644,7 +1118,7 @@ jobs:
             echo "| RAM after inference (peak) | ${PEAK} GB | ≤ ${LIMIT} GB (85%) |"
             echo "| Load delta | $(echo "$LOADED $BASE" | awk '{printf "%.2f", $1-$2}') GB | — |"
             echo "| Inference delta | $(echo "$PEAK $LOADED" | awk '{printf "%.2f", $1-$2}') GB | — |"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload server log on failure
         if: failure()

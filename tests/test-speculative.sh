@@ -213,6 +213,69 @@ else
     fail "Server became unresponsive"
 fi
 
+# ── Test 7: same checkpoint, no draft -> auto-detected qwen3_5 VLM ──
+# Every other Qwen3.5 launch in CI passes --draft-model/--dflash, which forces the LLM
+# factory and bypasses the hybrid prompt-cache split. b769 shipped with every text-only
+# chat to an auto-detected Qwen3.5 VLM failing with HTTP 500
+# (unsupportedBatchContinuation), and CI never ran that path.
+log "Test 7: $MAIN_MODEL without a draft (auto-detected VLM, text-only chat)"
+cleanup
+"$BINARY" --model "$MAIN_MODEL" --port "$PORT" --host "$HOST" >> "$LOG_FILE" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 300); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    curl -sf "$URL/health" >/dev/null 2>&1 && break
+    sleep 1
+done
+T1='{"role":"user","content":"Say hi."}'
+T2="$T1"',{"role":"assistant","content":"Hi."},{"role":"user","content":"Say bye."}'
+for MSGS in "$T1" "$T2"; do
+    N=$(echo "[$MSGS]" | jq length)
+    # No -f: keep the error body of a failed request, since the server does not log it.
+    R=$(curl -s --max-time 120 -w '\n%{http_code}' -X POST "$URL/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$MAIN_MODEL\",\"max_tokens\":8,\"temperature\":0,\"messages\":[$MSGS]}" 2>/dev/null || true)
+    CODE="${R##*$'\n'}"
+    BODY="${R%$'\n'*}"
+    if [ "$CODE" = "200" ] \
+        && echo "$BODY" | jq -e '.choices[0].finish_reason and .usage.prompt_tokens > 0' >/dev/null 2>&1; then
+        pass "No-draft VLM text chat, $N message(s): completed"
+    else
+        fail "No-draft VLM text chat, $N message(s): no completion (HTTP ${CODE:-none}: ${BODY:0:300})"
+    fi
+done
+# Stop with SIGTERM before reading the log, not cleanup()'s SIGKILL. stdout is a fully
+# buffered file here and a failing request never flushes it, so a "Prompt cache HIT" line
+# printed just before the error only reaches the log when the server exits normally.
+# If the server already died (a crash skips that flush too), the cache check below
+# cannot pass.
+SERVER_ALIVE=1
+kill -0 "$SERVER_PID" 2>/dev/null || SERVER_ALIVE=0
+kill -TERM "$SERVER_PID" 2>/dev/null || true
+for _ in $(seq 1 30); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 1
+done
+cleanup
+SERVER_PID=""
+# Guards against this test silently covering the LLM path (auto-detect off, or the
+# VLM->LLM fallback, which still prints the auto-detect line).
+if grep -q "Loading VLM (vision-language model)" "$LOG_FILE" \
+    && ! grep -q "Auto-detected VLM failed to load" "$LOG_FILE"; then
+    pass "No-draft: $MAIN_MODEL was loaded as a VLM"
+else
+    fail "No-draft: $MAIN_MODEL was not loaded as a VLM, so Test 7 did not cover the VLM path"
+fi
+# The earlier --draft-model runs never restore from the prompt cache, so any hit here
+# comes from the VLM server, which must bypass the cache.
+if grep -q "Prompt cache HIT" "$LOG_FILE"; then
+    fail "No-draft: the VLM server restored from the prompt cache"
+elif [ "$SERVER_ALIVE" = 0 ]; then
+    fail "No-draft: the server exited during Test 7, so its log may be missing a prompt cache hit"
+else
+    pass "No-draft: the VLM server bypassed the prompt cache"
+fi
+
 # ── Results ──────────────────────────────────────────────────────────
 echo ""
 log "═══════════════════════════════════════"

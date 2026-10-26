@@ -1,6 +1,6 @@
 name: Release
 
-# Auto-release on every push to main (like llama.cpp)
+# Publish the Release artifact from a successful CI run on the exact source commit.
 on:
   workflow_dispatch:
     inputs:
@@ -8,21 +8,11 @@ on:
         description: 'Create new release'
         required: true
         type: boolean
-  push:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
     branches:
       - main
-    paths:
-      - '**/*.swift'
-      - '**/*.c'
-      - '**/*.cpp'
-      - '**/*.h'
-      - '**/*.hpp'
-      - '**/*.m'
-      - '**/*.mm'
-      - '**/*.metal'
-      - 'Package.swift'
-      - 'Package.resolved'
-      - '.github/workflows/release.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,27 +20,63 @@ concurrency:
 
 permissions:
   contents: write
+  actions: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+  MACOSX_DEPLOYMENT_TARGET: '14.0'
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build-and-release:
-    runs-on: macos-15
+    runs-on: macos-26
+    timeout-minutes: 60
+    # Automatic releases require successful main push CI in this repository.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main'
+      && github.event.workflow_run.head_repository.full_name == github.repository)
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Full history for build number
           submodules: recursive
+          # Build exactly the commit CI validated. workflow_run would otherwise check out
+          # the branch tip, which may already have moved on to an untested commit.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Install Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain || true
+      # Retain the source change gate for automatic publication.
+      - name: Check for source changes since the last release
+        id: changes
+        run: |
+          LAST_TAG="$(git tag --list 'b[0-9]*' --sort=-creatordate | head -1)"
+          if [ -z "$LAST_TAG" ]; then
+            echo "No previous release tag; treating as source change."
+            echo "source=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED="$(git diff --name-only "$LAST_TAG"..HEAD || true)"
+          echo "Changed since $LAST_TAG:"; echo "$CHANGED" | head -40
+          if echo "$CHANGED" | grep -qE '\.(swift|c|cpp|h|hpp|m|mm|metal)$|^Package\.(swift|resolved)$|^\.github/workflows/release\.yml$|^mlx-swift(-lm)?$'; then
+            echo "source=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No source changes since $LAST_TAG — build will run, publish will be skipped."
+            echo "source=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Determine tag name
         id: tag
         run: |
           BUILD_NUMBER="$(git rev-list --count HEAD)"
           SHORT_HASH="$(git rev-parse --short=7 HEAD)"
-          echo "name=b${BUILD_NUMBER}" >> $GITHUB_OUTPUT
-          echo "full=b${BUILD_NUMBER}-${SHORT_HASH}" >> $GITHUB_OUTPUT
+          echo "name=b${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "full=b${BUILD_NUMBER}-${SHORT_HASH}" >> "$GITHUB_OUTPUT"
           echo "Build: b${BUILD_NUMBER} (${SHORT_HASH})"
 
       - name: Generate changelog
@@ -68,61 +94,92 @@ jobs:
           echo "$CHANGELOG" > /tmp/changelog.txt
           echo "Generated changelog with $(echo "$CHANGELOG" | wc -l | tr -d ' ') entries"
 
-      - name: Cache Swift packages
-        uses: actions/cache@v4
+      - name: Select the successful CI run for this exact source
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/expected-swiftlm.sha"
+          read -r source_sha < "$RUNNER_TEMP/expected-swiftlm.sha"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
+            echo "$TRIGGER_RUN_ID" > "$RUNNER_TEMP/ci-run-id.txt"
+          else
+            gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$source_sha" \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId' > "$RUNNER_TEMP/ci-run-id.txt"
+          fi
+          read -r run_id < "$RUNNER_TEMP/ci-run-id.txt"
+          if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Run CI Pipeline successfully for this exact commit before releasing."
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/ci-run.json"
+          jq -e --arg sha "$source_sha" --arg repository "$GITHUB_REPOSITORY" \
+            '.head_sha == $sha and .conclusion == "success" and .path == ".github/workflows/ci.yml" and .head_repository.full_name == $repository' \
+            "$RUNNER_TEMP/ci-run.json"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download the verified Release executable and shaders
+        uses: actions/download-artifact@v4
         with:
-          path: .build
-          key: ${{ runner.os }}-spm-release-${{ hashFiles('Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-release-
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.ci.outputs.run_id }}
+          name: swiftlm-native-release
+          path: .build/release/
 
-      - name: Build (Release)
+      - name: Verify the exact source and artifact checksums
         run: |
-          swift package resolve
-          swift build -c release
+          git rev-parse HEAD:mlx-swift > "$RUNNER_TEMP/expected-core.sha"
+          git rev-parse HEAD:mlx-swift-lm > "$RUNNER_TEMP/expected-library.sha"
+          cmp "$RUNNER_TEMP/expected-swiftlm.sha" .build/release/swiftlm.sha
+          cmp "$RUNNER_TEMP/expected-core.sha" .build/release/core.sha
+          cmp "$RUNNER_TEMP/expected-library.sha" .build/release/library.sha
+          cmp Package.resolved .build/release/Package.resolved
+          cd .build/release
+          shasum -a 256 -c SHA256SUMS
+          chmod +x SwiftLM SwiftBuddy
+          ./SwiftLM --help
 
-      - name: Install MLX Metal library
-        run: |
-          python3 -m venv /tmp/mlx_venv
-          /tmp/mlx_venv/bin/pip install --quiet mlx
-          MLX_LIB=$(find /tmp/mlx_venv -name "mlx.metallib" | head -n 1)
-          cp "$MLX_LIB" .build/release/mlx.metallib
-
-      - name: Verify binary
-        run: |
-          ls -lh .build/release/SwiftLM
-          file .build/release/SwiftLM
-          .build/release/SwiftLM --help || true
-
-      - name: Package binary
+      - name: Package the tested binary and shader resources
         run: |
           mkdir -p release
-          cp .build/release/SwiftLM release/
-          cp .build/release/mlx.metallib release/
+          cp -R .build/release/. release/
           cp LICENSE README.md release/
           cd release
-          # Verify the tarball will be self-contained before archiving
-          ls -lh
+          shasum -a 256 -c SHA256SUMS
           tar -czvf ../SwiftLM-${{ steps.tag.outputs.name }}-macos-arm64.tar.gz .
-          
+
       - name: Build macOS DMG Wrapper
         run: |
-          cd SwiftBuddy && python3 generate_xcodeproj.py
+          date -u +%Y.%m.%d > "$RUNNER_TEMP/app-version.txt"
+          git rev-list --count HEAD > "$RUNNER_TEMP/app-build.txt"
+          read -r SWIFTBUDDY_MARKETING_VERSION < "$RUNNER_TEMP/app-version.txt"
+          read -r SWIFTBUDDY_BUILD_NUMBER < "$RUNNER_TEMP/app-build.txt"
+          export SWIFTBUDDY_MARKETING_VERSION SWIFTBUDDY_BUILD_NUMBER
+          cd SwiftBuddy
+          python3 generate_xcodeproj.py
           cd ..
-          xcodebuild clean build \
-            -project SwiftBuddy/SwiftBuddy.xcodeproj \
-            -scheme SwiftBuddy \
-            -destination "generic/platform=macOS" \
-            -configuration Release \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_ENTITLEMENTS="" \
-            CODE_SIGNING_ALLOWED=NO \
-            TARGET_BUILD_DIR="$RUNNER_TEMP/build" \
-            BUILT_PRODUCTS_DIR="$RUNNER_TEMP/build"
+          mkdir -p SwiftBuddy/SwiftBuddy.xcodeproj/project.xcworkspace/xcshareddata/swiftpm
+          cp .build/release/Package.resolved SwiftBuddy/SwiftBuddy.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          xcodebuild -downloadComponent MetalToolchain
+          xcodebuild build -jobs 4 -onlyUsePackageVersionsFromResolvedFile \
+            -project SwiftBuddy/SwiftBuddy.xcodeproj -scheme SwiftBuddy \
+            -destination "generic/platform=macOS" -configuration Release \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO MACOSX_DEPLOYMENT_TARGET=14.0 \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" CODE_SIGNING_ALLOWED=NO \
+            TARGET_BUILD_DIR="$RUNNER_TEMP/build" BUILT_PRODUCTS_DIR="$RUNNER_TEMP/build"
+          app="$RUNNER_TEMP/build/SwiftBuddy.app"
+          test -x "$app/Contents/MacOS/SwiftBuddy"
+          cp .build/release/SwiftLM .build/release/mlx.metallib "$app/Contents/MacOS/"
+          cp -R .build/release/nax "$app/Contents/MacOS/nax"
+          shopt -s nullglob
+          for bundle in .build/release/*.bundle; do
+            cp -R "$bundle" "$app/Contents/Resources/"
+          done
           brew install create-dmg
           chmod +x scripts/build_dmg.sh
-          ./scripts/build_dmg.sh "$RUNNER_TEMP/build/SwiftBuddy.app"
+          ./scripts/build_dmg.sh "$app"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -134,15 +191,10 @@ jobs:
       - name: Prepare release notes
         id: notes
         run: |
-          CHANGELOG=$(cat /tmp/changelog.txt)
           cat > /tmp/release_notes.md << 'RELEASE_EOF'
           ## SwiftLM ${{ steps.tag.outputs.full }}
 
-          <details open>
-
-          ${{ github.event.head_commit.message }}
-
-          </details>
+          CI run: https://github.com/${{ github.repository }}/actions/runs/${{ steps.ci.outputs.run_id }}
 
           ### Changelog
 
@@ -152,8 +204,8 @@ jobs:
 
           ### Download
 
-          - **CLI Server**: [macOS Apple Silicon (arm64)](https://github.com/SharpAI/SwiftLM/releases/download/${{ steps.tag.outputs.name }}/SwiftLM-${{ steps.tag.outputs.name }}-macos-arm64.tar.gz)
-          - **GUI Desktop App**: Download the attached `SwiftBuddy-macOS.dmg` below!
+          - **CLI Server**: [macOS Apple Silicon (arm64)](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/SwiftLM-${{ steps.tag.outputs.name }}-macos-arm64.tar.gz)
+          - **GUI Desktop App**: Download the attached DMG file below!
 
           ### Quick Start
           
@@ -163,15 +215,18 @@ jobs:
           3. When launched, click "Model Options" to select or download an MLX local model to chat with.
 
           **For CLI Users (SwiftLM)**:
-          Please refer to the [Getting Started](https://github.com/SharpAI/SwiftLM#getting-started) section in the README.
-          > **Note:** `mlx.metallib` is bundled in the tar archive. Keep it in the same directory as the `SwiftLM` binary — Metal GPU compute will fail if it is missing.
+          Please refer to the [Getting Started](https://github.com/${{ github.repository }}#getting-started) section in the README.
+          Keep the extracted shader libraries and resource bundles beside the SwiftLM executable.
           RELEASE_EOF
 
       - name: Create release
-        if: ${{ github.event_name == 'push' || github.event.inputs.create_release == 'true' }}
+        if: >-
+          ${{ (github.event_name == 'workflow_run' && steps.changes.outputs.source == 'true')
+          || github.event.inputs.create_release == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
+          target_commitish: ${{ github.event.workflow_run.head_sha || github.sha }}
           name: "SwiftLM ${{ steps.tag.outputs.name }}"
           body_path: /tmp/release_notes.md
           files: |

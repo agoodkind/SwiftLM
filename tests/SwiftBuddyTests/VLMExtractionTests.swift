@@ -21,7 +21,7 @@ final class VLMExtractionTests: XCTestCase {
         let images = message.extractImages()
         XCTAssertEqual(images.count, 1)
         
-        if case let .ciImage(image) = images.first {
+        if case .ciImage(let image)? = images.first?.source {
             XCTAssertNotNil(image)
             XCTAssertEqual(image.extent.width, 1)
             XCTAssertEqual(image.extent.height, 1)
@@ -44,7 +44,7 @@ final class VLMExtractionTests: XCTestCase {
         let images = message.extractImages()
         XCTAssertEqual(images.count, 1)
         
-        if case let .url(url) = images.first {
+        if case .url(let url)? = images.first?.source {
             XCTAssertEqual(url.absoluteString, "https://example.com/test.jpg")
         } else {
             XCTFail("Expected .url, got \(String(describing: images.first))")

@@ -1,5 +1,5 @@
 // ModelStorage.swift — Platform-aware model storage resolution
-// macOS: ~/Library/Caches/huggingface/hub/  (same as defaultHubApi)
+// macOS: ~/.cache/huggingface/hub/ (or $HF_HUB_CACHE / $HF_HOME/hub — same as huggingface-cli)
 // iOS:   ~/Library/Application Support/SwiftBuddy/Models/ (persistent, excluded from iCloud)
 
 import Foundation
@@ -8,12 +8,23 @@ public enum ModelStorage {
 
     // MARK: — Platform Paths
 
+    /// Test hook: when set, overrides `cacheRoot` entirely. Deliberately not public —
+    /// tests reach it through `@testable import`.
+    nonisolated(unsafe) static var cacheRootOverride: URL?
+
     /// Root directory where model files are stored on this platform.
     /// This is the `downloadBase` passed to `HubApi`.
     public static var cacheRoot: URL {
+        if let cacheRootOverride { return cacheRootOverride }
         #if os(macOS)
-        // macOS: Single source of truth with Python (huggingface-cli / mlx_lm)
-        if let hfHome = ProcessInfo.processInfo.environment["HF_HOME"] {
+        // macOS: Single source of truth with Python (huggingface-cli / mlx_lm).
+        // Precedence matches huggingface_hub: HF_HUB_CACHE points at the hub
+        // directory itself, HF_HOME at its parent.
+        let environment = ProcessInfo.processInfo.environment
+        if let hubCache = environment["HF_HUB_CACHE"], !hubCache.isEmpty {
+            return URL(fileURLWithPath: hubCache)
+        }
+        if let hfHome = environment["HF_HOME"], !hfHome.isEmpty {
             return URL(fileURLWithPath: hfHome).appendingPathComponent("hub")
         }
         return FileManager.default.homeDirectoryForCurrentUser
@@ -43,14 +54,72 @@ public enum ModelStorage {
 
     /// Local cache directory for a model, or nil if not downloaded.
     public static func cacheDirectory(for modelId: String) -> URL? {
-        materializedDirectory(for: modelId) ?? hubCacheDirectory(for: modelId)
+        materializedDirectory(for: modelId) ?? hubCacheDirectory(for: modelId) ?? plainDirectory(for: modelId)
+    }
+
+    /// A model folder copied straight into the cache root, with no `models--` prefix
+    /// and no `snapshots/` level — e.g. `<cacheRoot>/Qwen3.5-27B-oQ6/` or
+    /// `<cacheRoot>/mlx-community/Qwen3.5-27B-oQ6/` (issue #110).
+    static func plainDirectory(for modelId: String) -> URL? {
+        guard let dir = plainDirectoryURL(for: modelId) else { return nil }
+        return directoryExists(dir) ? dir : nil
+    }
+
+    private static func plainDirectoryURL(for modelId: String) -> URL? {
+        let url = modelId.split(separator: "/").reduce(cacheRoot) { url, component in
+            url.appendingPathComponent(String(component), isDirectory: true)
+        }
+        return isSafeModelDirectory(url) ? url : nil
+    }
+
+    /// Whether a URL is a location a model may legitimately occupy, i.e. a strict
+    /// descendant of the cache root that is neither the root itself nor the shared
+    /// `models/` wrapper.
+    ///
+    /// `delete()` calls `FileManager.removeItem` on the directories associated with an
+    /// id, so this is a destructive-action guard and must resolve the path rather than
+    /// compare strings: an id of `"models/"`, `"/models"` or `"./models"` all reduce to
+    /// `<cacheRoot>/models`, and `".."` components escape the root entirely.
+    static func isSafeModelDirectory(_ url: URL) -> Bool {
+        // Resolve symlinks on both sides: standardizedFileURL alone is lexical, so an
+        // existing symlink component under the root could point anywhere and still look
+        // like a descendant. Note resolvingSymlinksInPath only resolves paths that
+        // exist — for a path that does not, the two sides can end up in different
+        // namespaces and the descendant check fails, i.e. it fails closed. That is the
+        // safe direction, and such paths are dropped by the directoryExists filter in
+        // associatedDirectories anyway.
+        let root = cacheRoot.resolvingSymlinksInPath().standardizedFileURL
+        let candidate = url.resolvingSymlinksInPath().standardizedFileURL
+        let rootComponents = root.pathComponents
+        let candidateComponents = candidate.pathComponents
+
+        // Must be strictly below the cache root, by at least one component.
+        guard candidateComponents.count > rootComponents.count,
+            Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
+        else { return false }
+
+        // Never the shared layout wrapper or anything directly inside it that is not a
+        // concrete model (i.e. the wrapper itself or an org directory). macOS APFS is
+        // case-insensitive by default, so "Models" and "models" are the same directory
+        // while == on the strings is not — a case-sensitive compare here let
+        // delete("Models") wipe every downloaded model (review finding on #116).
+        let relative = Array(candidateComponents.dropFirst(rootComponents.count))
+        let isWrapperName =
+            relative[0].compare("models", options: [.caseInsensitive]) == .orderedSame
+        if isWrapperName && relative.count < 3 { return false }
+        return true
     }
 
     /// Swift Hub's materialized repository directory.
     /// `HubApi(downloadBase: cacheRoot).snapshot(from:)` writes here.
     public static func materializedDirectory(for modelId: String) -> URL? {
         let dir = materializedDirectoryURL(for: modelId)
-        return directoryExists(dir) ? dir : nil
+        // Same guard delete() applies, so an org-less id like "gpt2" — which resolves to
+        // <root>/models/gpt2 and is rejected there — is not loadable here either. It was
+        // previously loadable but undeletable: delete() removed nothing and reported
+        // success (review finding on #116). scanDownloadedModels only emits org/name, so
+        // no listed model is affected.
+        return directoryExists(dir) && isSafeModelDirectory(dir) ? dir : nil
     }
 
     private static func materializedDirectoryURL(for modelId: String) -> URL {
@@ -74,11 +143,14 @@ public enum ModelStorage {
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
-    /// True if a model's cache directory exists and contains files.
-    // The snapshot directory is where safetensors files live inside the HF hub layout:
-    // <cacheRoot>/models--org--name/snapshots/main/
+    /// The directory holding a model's weight files.
+    ///
+    /// Resolves through every supported layout — see `scanDownloadedModels()` — and
+    /// only falls back to the canonical hub path when none of them exist. Returning a
+    /// path that does not exist would silently misconfigure consumers such as SSD
+    /// expert streaming, which points its reader at this directory.
     public static func snapshotDirectory(for modelId: String) -> URL {
-        return materializedDirectory(for: modelId) ?? resolvedSnapshotDirectory(for: modelId) ?? cacheRoot
+        modelContentDirectories(for: modelId).first ?? cacheRoot
             .appendingPathComponent(hubDirName(for: modelId))
             .appendingPathComponent("snapshots/main")
     }
@@ -118,6 +190,29 @@ public enum ModelStorage {
         return directories.count == 1 ? directories[0] : nil
     }
 
+    /// The directory to load a model from when it does not live at the materialized
+    /// `<cacheRoot>/models/<id>` path that `HubApi` resolves, i.e. when the user copied
+    /// it in by hand or it came from `huggingface-cli`. Returns nil when the standard
+    /// path applies, so callers keep the normal id-based flow (and its download
+    /// behaviour) for everything else.
+    public static func localLoadDirectory(for modelId: String) -> URL? {
+        guard materializedDirectory(for: modelId) == nil else { return nil }
+        return validatedContentDirectory(for: modelId)
+    }
+
+    /// The first directory for this model whose files actually pass verification.
+    ///
+    /// `isDownloaded` succeeds when *any* candidate validates, so pairing it with
+    /// `modelContentDirectories.first` could hand a caller a different, broken directory
+    /// — e.g. a half-deleted `snapshots/<hash>/` that still exists while the real weights
+    /// sit in a hand-copied folder. Callers loading by directory have no download
+    /// fallback, so the directory they get must be the one that validated.
+    public static func validatedContentDirectory(for modelId: String) -> URL? {
+        guard !hasIncompleteFiles(for: modelId) else { return nil }
+        return modelContentDirectories(for: modelId)
+            .first { validateModelFiles(in: $0, logFailures: false) }
+    }
+
     public static func isDownloaded(_ modelId: String) -> Bool {
         verifyModelIntegrity(for: modelId, logFailures: false)
     }
@@ -128,7 +223,19 @@ public enum ModelStorage {
     /// Checks `text_config.max_position_embeddings` first (VLM/MoE models),
     /// then falls back to top-level `max_position_embeddings`.
     public static func readMaxContextLength(for modelId: String) -> Int? {
-        guard let config = readModelConfig(for: modelId) else { return nil }
+        maxContextLength(fromConfig: readModelConfig(for: modelId))
+    }
+
+    /// Same as `readMaxContextLength(for:)` but for a model addressed by an
+    /// arbitrary directory rather than a HuggingFace-cache-resolved model ID —
+    /// used when loading a model the user pointed at directly (see
+    /// `isLocalDirectoryPath`).
+    public static func readMaxContextLength(inDirectory directory: URL) -> Int? {
+        maxContextLength(fromConfig: readModelConfig(inDirectory: directory))
+    }
+
+    private static func maxContextLength(fromConfig config: [String: Any]?) -> Int? {
+        guard let config else { return nil }
 
         // VLM/MoE models nest the context length in text_config
         if let textConfig = config["text_config"] as? [String: Any],
@@ -146,6 +253,31 @@ public enum ModelStorage {
         if let maxSeq = config["max_seq_len"] as? Int { return maxSeq }
 
         return nil
+    }
+
+    // MARK: — Local Directory Models
+
+    /// Whether `modelId` is actually a filesystem path to a directory the user
+    /// pointed the app at directly (e.g. a model on an external drive downloaded
+    /// via `hf download --local-dir`), rather than a HuggingFace repo ID.
+    ///
+    /// Mirrors the identical check the `SwiftLM` CLI's `Server.swift` already
+    /// does for `--model`: a plain `FileManager` existence + directory check, no
+    /// `~` expansion (the caller is expected to hand over an already-resolved
+    /// absolute path — see `ModelManagementView`'s `NSOpenPanel` flow).
+    public static func isLocalDirectoryPath(_ modelId: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: modelId, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    /// Whether `directory` looks like a usable model folder — same weight/config
+    /// validation `verifyModelIntegrity` applies to HuggingFace-cache layouts,
+    /// reused here so a folder picked via `NSOpenPanel` can be rejected with a
+    /// clear error before `InferenceEngine.load` ever attempts to construct a
+    /// model from it.
+    public static func validateLocalModelDirectory(_ directory: URL) -> Bool {
+        validateModelFiles(in: directory, logFailures: true)
     }
 
     /// Read the raw config.json dictionary for a downloaded model.
@@ -173,12 +305,18 @@ public enum ModelStorage {
 
     private static func modelContentDirectories(for modelId: String) -> [URL] {
         var directories: [URL] = []
-        if let materialized = materializedDirectory(for: modelId) {
-            directories.append(materialized)
+        func append(_ url: URL?) {
+            guard let url, !directories.contains(url) else { return }
+            directories.append(url)
         }
-        if let snapshot = resolvedSnapshotDirectory(for: modelId), !directories.contains(snapshot) {
-            directories.append(snapshot)
-        }
+
+        append(materializedDirectory(for: modelId))
+        append(resolvedSnapshotDirectory(for: modelId))
+        // Issue #110: a `models--org--name` folder copied by hand often holds the
+        // weights directly, with no `snapshots/<hash>/` level for the HF cache layout.
+        append(hubCacheDirectory(for: modelId))
+        // …and a folder copied in without the `models--` prefix at all.
+        append(plainDirectory(for: modelId))
         return directories
     }
 
@@ -246,13 +384,45 @@ public enum ModelStorage {
 
     public static func readModelConfig(for modelId: String) -> [String: Any]? {
         for directory in modelContentDirectories(for: modelId) {
-            let configPath = directory.appendingPathComponent("config.json")
-            guard let data = try? Data(contentsOf: configPath),
-                  let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            return config
+            if let config = readModelConfig(inDirectory: directory) { return config }
         }
         return nil
+    }
+
+    /// Same as `readModelConfig(for:)` but for an already-resolved directory —
+    /// used for local models addressed directly by path (see
+    /// `isLocalDirectoryPath`), which have no HuggingFace-cache layout to scan.
+    public static func readModelConfig(inDirectory directory: URL) -> [String: Any]? {
+        let configPath = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configPath),
+              let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return config
+    }
+
+    /// A cheap "does this config declare a Mixture-of-Experts model" check, for
+    /// models with no `ModelCatalog` entry to consult — chiefly local-directory
+    /// models (`isLocalDirectoryPath`), which can never match a catalog id since
+    /// the catalog only lists HuggingFace-style ids.
+    ///
+    /// Checks the same field names `Sources/SwiftLM/ModelProfiler.swift`'s
+    /// `findExpertCounts` looks for (`num_local_experts`/`num_experts`/
+    /// `n_routed_experts`), at the top level and inside `text_config` (the most
+    /// common one-level VLM/multimodal wrapper). `ModelProfiler` itself lives in
+    /// the CLI target and isn't importable from here; this intentionally doesn't
+    /// replicate its full breadth-first nested-wrapper walk — this check only
+    /// needs a yes/no answer for "should SSD expert streaming default on," not
+    /// the exact expert counts, so the common cases are enough.
+    public static func configIndicatesMoE(_ config: [String: Any]) -> Bool {
+        let expertKeys = ["num_local_experts", "num_experts", "n_routed_experts"]
+        func hasExpertCount(_ container: [String: Any]) -> Bool {
+            expertKeys.contains { (container[$0] as? Int).map { $0 > 0 } ?? false }
+        }
+        if hasExpertCount(config) { return true }
+        if let textConfig = config["text_config"] as? [String: Any], hasExpertCount(textConfig) {
+            return true
+        }
+        return false
     }
 
     // MARK: — Disk Operations
@@ -302,7 +472,17 @@ public enum ModelStorage {
     }
 
     /// Scan the cache root and return all recognizable downloaded models.
-    /// Only returns models present in `ModelCatalog.all`.
+    ///
+    /// Recognised layouts, all rooted at `cacheRoot`:
+    ///   - `models--org--name/snapshots/<hash>/`  — the huggingface-cli cache layout
+    ///   - `models--org--name/`                   — the same folder copied by hand,
+    ///                                              weights sitting directly inside
+    ///   - `models/org/name/`                     — Swift Hub's materialized layout
+    ///   - `org/name/` or `name/`                 — a model folder copied straight in
+    ///
+    /// The last two forms exist because users copy model folders into the cache by
+    /// hand and expect them to appear (issue #110). Directories that look like a model
+    /// but fail verification are reported by `diagnoseUnrecognizedDirectories()`.
     public static func scanDownloadedModels() -> [ScannedModel] {
         guard FileManager.default.fileExists(atPath: cacheRoot.path),
               let contents = try? FileManager.default.contentsOfDirectory(
@@ -319,7 +499,7 @@ public enum ModelStorage {
                     .replacingOccurrences(of: "^models--", with: "", options: .regularExpression)
                     .replacingOccurrences(of: "--", with: "/")
                 addScannedModelIfDownloaded(modelId: modelId, dir: dir, resultsById: &resultsById)
-            } else if dir.lastPathComponent == "models" {
+            } else if dir.lastPathComponent.compare("models", options: [.caseInsensitive]) == .orderedSame {
                 guard let organizations = try? FileManager.default.contentsOfDirectory(
                     at: dir,
                     includingPropertiesForKeys: [.contentModificationDateKey],
@@ -338,9 +518,110 @@ public enum ModelStorage {
                         addScannedModelIfDownloaded(modelId: modelId, dir: modelDir, resultsById: &resultsById)
                     }
                 }
+            } else if directoryExists(dir) {
+                // Hand-copied folder: either the model itself, or an org directory
+                // holding one (issue #110).
+                let name = dir.lastPathComponent
+                if containsModelConfig(dir) {
+                    addScannedModelIfDownloaded(modelId: name, dir: dir, resultsById: &resultsById)
+                } else {
+                    let children = (try? FileManager.default.contentsOfDirectory(
+                        at: dir,
+                        includingPropertiesForKeys: [.contentModificationDateKey],
+                        options: [.skipsHiddenFiles]
+                    )) ?? []
+                    for child in children where directoryExists(child) && containsModelConfig(child) {
+                        addScannedModelIfDownloaded(
+                            modelId: "\(name)/\(child.lastPathComponent)",
+                            dir: child,
+                            resultsById: &resultsById
+                        )
+                    }
+                }
             }
         }
         return resultsById.values.sorted { ($0.modifiedDate ?? .distantPast) > ($1.modifiedDate ?? .distantPast) }
+    }
+
+    /// A directory holding a model's own files (as opposed to a cache wrapper).
+    private static func containsModelConfig(_ directory: URL) -> Bool {
+        FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.json").path)
+    }
+
+    /// Directories under the cache root that look like a model but were not returned
+    /// by `scanDownloadedModels()`, paired with the reason each was rejected.
+    ///
+    /// Without this, a model the app refuses to list is indistinguishable from one it
+    /// never looked at — which is what made issue #110 hard to diagnose.
+    /// - Parameter knownModels: the result of a `scanDownloadedModels()` the caller
+    ///   already performed; omit to run a fresh scan.
+    public static func diagnoseUnrecognizedDirectories(
+        knownModels: [ScannedModel]? = nil
+    ) -> [(directory: URL, reason: String)] {
+        // Compare canonical paths: contentsOfDirectory resolves symlinks (/var →
+        // /private/var) while cacheDirectory builds paths from cacheRoot verbatim,
+        // so raw string comparison would report every valid model as unrecognized.
+        let recognized = Set((knownModels ?? scanDownloadedModels()).map { canonicalPath($0.cacheDirectory) })
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: cacheRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var findings: [(directory: URL, reason: String)] = []
+        for dir in contents where directoryExists(dir) && dir.lastPathComponent != "models" {
+            let candidates = containsModelConfig(dir)
+                ? [dir]
+                : ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
+                    .filter { directoryExists($0) && containsModelConfig($0) }
+
+            for candidate in candidates where !recognized.contains(canonicalPath(candidate)) {
+                findings.append((candidate, rejectionReason(for: candidate)))
+            }
+        }
+        return findings
+    }
+
+    private static func canonicalPath(_ url: URL) -> String {
+        url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private static func rejectionReason(for directory: URL) -> String {
+        if countIncompleteFiles(in: directory) > 0 {
+            return "contains .incomplete files — finish or delete the partial download"
+        }
+        // Check the metadata first: validateModelFiles rejects a zero-byte config.json
+        // or tokenizer.json before it ever looks at weights, so reporting a weights
+        // reason there sent the user to inspect the wrong file (review finding on #116).
+        for name in ["config.json", "tokenizer.json"] {
+            let path = directory.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: path.path) else {
+                if name == "config.json" { return "config.json is missing" }
+                continue
+            }
+            if fileSizeResolvingSymlink(path) == 0 { return "\(name) is empty (0 bytes)" }
+        }
+        let indexPath = directory.appendingPathComponent("model.safetensors.index.json")
+        let hasIndex = FileManager.default.fileExists(atPath: indexPath.path)
+        let single = directory.appendingPathComponent("model.safetensors")
+        let singleSize = fileSizeResolvingSymlink(single)
+        if !hasIndex {
+            // A single-file model is judged on its own size before anything is said about
+            // shards — otherwise a truncated model.safetensors was reported as "sharded
+            // weights present", naming an index.json that never existed.
+            if let singleSize {
+                return singleSize > 1024
+                    ? "model.safetensors is present but the model still failed verification"
+                    : "model.safetensors is truncated (\(singleSize) bytes)"
+            }
+            let shards = (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
+                .filter { $0.hasSuffix(".safetensors") && $0 != "model.safetensors" } ?? []
+            if shards.isEmpty {
+                return "no .safetensors weights found (GGUF and .npz models are not supported)"
+            }
+            return "sharded weights present but model.safetensors.index.json is missing"
+        }
+        return "weight files missing or truncated relative to model.safetensors.index.json"
     }
 
     private static func addScannedModelIfDownloaded(
@@ -402,7 +683,7 @@ public enum ModelStorage {
                     .replacingOccurrences(of: "^models--", with: "", options: .regularExpression)
                     .replacingOccurrences(of: "--", with: "/")
                 addIncompleteDownloadIfNeeded(modelId: modelId, dir: dir, resultsById: &resultsById)
-            } else if dir.lastPathComponent == "models" {
+            } else if dir.lastPathComponent.compare("models", options: [.caseInsensitive]) == .orderedSame {
                 guard let organizations = try? FileManager.default.contentsOfDirectory(
                     at: dir,
                     includingPropertiesForKeys: [.contentModificationDateKey],
@@ -475,10 +756,20 @@ public enum ModelStorage {
     // MARK: — Helpers
 
     private static func associatedDirectories(for modelId: String) -> [URL] {
-        let candidates = [
+        var candidates = [
             materializedDirectoryURL(for: modelId),
             hubCacheDirectoryURL(for: modelId),
         ]
+        // Only a hand-copied folder that actually exists — plainDirectoryURL for an
+        // unknown id can point at an unrelated directory, and delete() walks this list.
+        if let plain = plainDirectory(for: modelId) {
+            candidates.append(plain)
+        }
+        // Every path here is a removeItem target. An empty id makes
+        // appendingPathComponent("") a no-op, so materializedDirectoryURL(for: "")
+        // resolves to the shared `models/` wrapper and would delete every downloaded
+        // model; the same guard covers `..` escapes on any of the three layouts.
+        candidates = candidates.filter { isSafeModelDirectory($0) }
 
         var seen = Set<String>()
         return candidates.filter { url in
